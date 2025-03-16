@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 from .inputs import (ModalityData, MultiModalDataDict, MultiModalKwargs,
                      PlaceholderRange)
+from PIL import Image
 
 logger = init_logger(__name__)
 
@@ -461,3 +462,13 @@ class MediaIO(ABC, Generic[_T]):
     @abstractmethod
     def load_file(self, filepath: Path) -> _T:
         raise NotImplementedError
+
+class CornserveData(Generic[_T]):
+    """A placeholder class for data returned by cornserve."""
+    def __init__(self, id: str, data: _T) -> None:
+        self.id = id
+        # this field stores the original data
+        self.data = data
+    
+    def __repr__(self) -> str:
+        return f"CornserveData(id={self.id}, data={self.data})"

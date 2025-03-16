@@ -26,6 +26,7 @@ from .inputs import (MultiModalDataDict, MultiModalEncDecInputs,
                      MultiModalKwargsItem, PlaceholderRange)
 from .parse import (DictEmbeddingItems, EmbeddingItems, MultiModalDataItems,
                     MultiModalDataParser)
+from .utils import CornserveData
 
 if TYPE_CHECKING:
     from .profiling import BaseDummyInputsBuilder
@@ -1097,6 +1098,17 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         In addition, return whether prompt updates have been applied.
         """
         processor_data, passthrough_data = self._get_hf_mm_data(mm_items)
+        # patch the processor_data
+        patched_data_ids = []
+        if 'images' in processor_data and isinstance(processor_data['images'], list):
+            patched_images = []
+            for d in processor_data['images']:
+                if isinstance(d, CornserveData):
+                    patched_images.append(d.data)
+                    patched_data_ids.append(d.id)
+                else:
+                    patched_images.append(d)
+            processor_data = {**processor_data, 'images': patched_images}
 
         processed_data = self._call_hf_processor(
             prompt=prompt_text,
@@ -1111,6 +1123,8 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             processed_data,
             self._get_mm_fields_config(processed_data, hf_processor_mm_kwargs),
         )
+        if patched_data_ids:
+            mm_kwargs["data_ids"] = patched_data_ids
 
         is_update_applied = self._hf_processor_applies_updates(
             prompt_text=prompt_text,

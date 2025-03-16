@@ -15,10 +15,12 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 
 from .audio import AudioMediaIO
-from .base import MediaIO
+from .base import MediaIO, CornserveData
 from .image import ImageMediaIO
 from .inputs import PlaceholderRange
 from .video import VideoMediaIO
+
+from typing import Union
 
 logger = init_logger(__name__)
 
@@ -61,7 +63,7 @@ class MediaConnector:
         self,
         url_spec: ParseResult,
         media_io: MediaIO[_M],
-    ) -> _M:
+        ) -> _M | CornserveData[_M]:
         data_spec, data = url_spec.path.split(",", 1)
         media_type, data_type = data_spec.split(";", 1)
 
@@ -95,7 +97,7 @@ class MediaConnector:
         media_io: MediaIO[_M],
         *,
         fetch_timeout: Optional[int] = None,
-    ) -> _M:
+    ) -> _M | CornserveData[_M]:
         url_spec = urlparse(url)
 
         if url_spec.scheme.startswith("http"):
@@ -119,7 +121,7 @@ class MediaConnector:
         media_io: MediaIO[_M],
         *,
         fetch_timeout: Optional[int] = None,
-    ) -> _M:
+    ) -> Union[_M, CornserveData]:
         url_spec = urlparse(url)
 
         if url_spec.scheme.startswith("http"):
@@ -129,6 +131,15 @@ class MediaConnector:
             return media_io.load_bytes(data)
 
         if url_spec.scheme == "data":
+            if url_spec.path.startswith("image/uuid;"):
+                # url = f"data:image/uuid;data_id={uuid.uuid4().hex};url={url},"
+                full_str = url_spec.path.replace("image/uuid;", "")
+                uuid = full_str.split(";")[0].replace("data_id=", "")
+                url = full_str.split(";")[1].replace("url=", "")[:-1]
+                # assumes HTTP(s)
+                data = await self.connection.async_get_bytes(
+                    url, timeout=fetch_timeout)
+                return CornserveData(id=uuid, data=media_io.load_bytes(data))
             return self._load_data_url(url_spec, media_io)
 
         if url_spec.scheme == "file":
@@ -140,7 +151,7 @@ class MediaConnector:
     def fetch_audio(
         self,
         audio_url: str,
-    ) -> tuple[np.ndarray, Union[int, float]]:
+    ) -> tuple[np.ndarray, Union[int, float]] | CornserveData:
         """
         Load audio from a URL.
         """
@@ -155,7 +166,7 @@ class MediaConnector:
     async def fetch_audio_async(
         self,
         audio_url: str,
-    ) -> tuple[np.ndarray, Union[int, float]]:
+    ) -> tuple[np.ndarray, Union[int, float]] | CornserveData:
         """
         Asynchronously fetch audio from a URL.
         """
@@ -172,7 +183,7 @@ class MediaConnector:
         image_url: str,
         *,
         image_mode: str = "RGB",
-    ) -> Image.Image:
+    ) -> Image.Image | CornserveData:
         """
         Load a PIL image from a HTTP or base64 data URL.
 
@@ -191,12 +202,13 @@ class MediaConnector:
         image_url: str,
         *,
         image_mode: str = "RGB",
-    ) -> Image.Image:
+    ) -> Image.Image | CornserveData:
         """
         Asynchronously load a PIL image from a HTTP or base64 data URL.
 
         By default, the image is converted into RGB format.
         """
+        # CORNSERVE the media_io used is here
         image_io = ImageMediaIO(image_mode=image_mode)
 
         return await self.load_from_url_async(
@@ -211,7 +223,7 @@ class MediaConnector:
         *,
         image_mode: str = "RGB",
         num_frames: int = 32,
-    ) -> npt.NDArray:
+    ) -> npt.NDArray | CornserveData:
         """
         Load video from a HTTP or base64 data URL.
         """

@@ -40,6 +40,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from cornserve.services.sidecar.api import TensorSidecarReceiverExecutor
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -98,6 +99,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         self.head_size = model_config.get_head_size()
         self.hidden_size = model_config.get_hidden_size()
+
+        self.cornserve_config = vllm_config.cornserve_config
+
+        self.sidecar_reader = None
+        if self.cornserve_config:
+            self.sidecar_reader = TensorSidecarReceiverExecutor(
+                self.cornserve_config.sidecars[0],
+                (-1, self.hidden_size),
+                self.dtype,
+                )
 
         self.attn_backend = get_attn_backend(
             self.head_size,
@@ -777,6 +788,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return torch.from_numpy(spec_decode_logits_indices).to(
             self.device, non_blocking=True)
 
+    def _get_encoder_outputs(
+            self,
+            scheduler_output: "SchedulerOutput",
+    ) -> None:
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        if not scheduled_encoder_inputs:
+            return
+
+        req_input_ids: list[tuple[str, int]] = []
+        encoder_outputs = []
+        for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+            for input_id in encoder_input_ids:
+                req_input_ids.append((req_id, input_id))
+                pos_info = req_state.mm_positions[input_id]
+                num_tokens = pos_info["length"]
+
+                if "data_ids" in req_state.mm_inputs[input_id] and len(req_state.mm_inputs[input_id]["data_ids"]) > 0:
+                    data_id = req_state.mm_inputs[input_id]["data_ids"][0]
+                    id = req_id.split("-")[-1] + str(data_id)
+                    logger.info("CORNSERVE trying to read %s", id)
+                    received_num_tokens = 0
+                    if self.sidecar_reader:
+                        output = self.sidecar_reader.recv(id).to(self.device)
+                        received_num_tokens = output.size(0)
+                        logger.info("CORNSERVE expecting %d received %d", num_tokens, received_num_tokens)
+                        if output.size(0) == num_tokens:
+                            encoder_outputs.append(output)
+                            continue
+                    logger.error("CORNSERVE Received number of tokens %d does not match expected number of tokens %d", received_num_tokens, num_tokens)
+
+                logger.warning("CORNSERVE Using random encoder inputs")
+                output = torch.randn(
+                    num_tokens, 
+                    self.hidden_size, 
+                    device=self.device, 
+                    dtype=self.dtype
+                )
+                encoder_outputs.append(output)
+
+        # Cache the encoder outputs.
+        for (req_id, input_id), output in zip(req_input_ids, encoder_outputs):
+            if req_id not in self.encoder_cache:
+                self.encoder_cache[req_id] = {}
+            self.encoder_cache[req_id][input_id] = output
+
+
     def _execute_encoder(self, scheduler_output: "SchedulerOutput"):
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if not scheduled_encoder_inputs:
@@ -926,7 +984,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.is_multimodal_model:
             # Run the multimodal encoder if any.
-            self._execute_encoder(scheduler_output)
+            # CORNSERVE patch
+            # self._execute_encoder(scheduler_output)
+            self._get_encoder_outputs(scheduler_output)
             encoder_outputs = self._gather_encoder_outputs(scheduler_output)
         else:
             encoder_outputs = []

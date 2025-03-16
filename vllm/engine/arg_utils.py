@@ -17,7 +17,7 @@ from vllm.config import (CacheConfig, CompilationConfig, ConfigFormat,
                          ModelConfig, ModelImpl, ObservabilityConfig,
                          ParallelConfig, PoolerConfig, PromptAdapterConfig,
                          SchedulerConfig, SpeculativeConfig, TaskOption,
-                         TokenizerPoolConfig, VllmConfig)
+                         TokenizerPoolConfig, VllmConfig, CornServeConfig)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
@@ -90,6 +90,7 @@ def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
+    cornserve_sidecar_ranks: Optional[List[int]] = None
     model: str = 'facebook/opt-125m'
     served_model_name: Optional[Union[str, List[str]]] = None
     tokenizer: Optional[str] = None
@@ -246,6 +247,15 @@ class EngineArgs:
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
+
+        # Cornserve arguments
+        parser.add_argument(
+            "--cornserve-sidecar-ranks",
+            type=int,
+            nargs="+",  # This makes it accept one or more values
+            default=[],
+            help="List of integer ranks for sidecar processes."
+        )
 
         # Model arguments
         parser.add_argument(
@@ -1408,6 +1418,8 @@ class EngineArgs:
             or "all" in detailed_trace_modules,
         )
 
+        cornserve_config = CornServeConfig(self.cornserve_sidecar_ranks) if self.cornserve_sidecar_ranks else None
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1423,6 +1435,7 @@ class EngineArgs:
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             additional_config=self.additional_config,
+            cornserve_config=cornserve_config,
         )
 
         if envs.VLLM_USE_V1:

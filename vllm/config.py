@@ -3215,6 +3215,10 @@ class CompilationConfig(BaseModel):
 
 
 @dataclass
+class CornServeConfig:
+    sidecars: list[int]
+
+@dataclass
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
@@ -3244,6 +3248,8 @@ class VllmConfig:
     # tree config registration.
     additional_config: SupportsHash = field(default=None,
                                             init=True)  # type: ignore
+    cornserve_config: Optional[CornServeConfig] = None
+
     instance_id: str = ""
 
     def compute_hash(self) -> str:

@@ -49,6 +49,7 @@ class TokensPrompt(TypedDict):
     Optional multi-modal data to pass to the model,
     if the model supports it.
     """
+    data_ids: NotRequired[List[str]]
 
     mm_processor_kwargs: NotRequired[Dict[str, Any]]
     """

@@ -18,6 +18,7 @@ from .audio import resample_audio
 from .inputs import (AudioItem, HfAudioItem, HfImageItem, HfVideoItem,
                      ImageItem, ModalityData, MultiModalDataDict,
                      MultiModalFieldConfig, MultiModalKwargs, VideoItem)
+from vllm.multimodal.utils import CornserveData
 
 _T = TypeVar("_T")
 _I = TypeVar("_I")
@@ -201,6 +202,8 @@ class ImageProcessorItems(ProcessorBatchItems[HfImageItem]):
         if isinstance(image, (np.ndarray, torch.Tensor)):
             _, h, w = image.shape
             return ImageSize(w, h)
+        if isinstance(image, CornserveData):
+            return ImageSize(*image.data.size)
 
         assert_never(image)
 

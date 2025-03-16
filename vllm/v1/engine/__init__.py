@@ -60,6 +60,13 @@ class EngineCoreRequest(
     arrival_time: float
     lora_request: Optional[LoRARequest]
 
+    def get_data_ids(self) -> list:
+        data_ids = []
+        if self.mm_inputs is not None:
+            for mm_kwargs in self.mm_inputs:
+                if mm_kwargs is not None and "data_ids" in mm_kwargs:
+                    data_ids += mm_kwargs["data_ids"]
+        return data_ids
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""

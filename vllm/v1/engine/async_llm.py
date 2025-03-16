@@ -33,6 +33,9 @@ from vllm.v1.metrics.loggers import (LoggingStatLogger, PrometheusStatLogger,
                                      StatLoggerBase)
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
+from vllm.multimodal.utils import CornserveData
+from cornserve.services.sidecar.api import TensorSidecarAsyncReceiver
+
 logger = init_logger(__name__)
 
 
@@ -53,6 +56,15 @@ class AsyncLLM(EngineClient):
         assert start_engine_loop
 
         self.model_config = vllm_config.model_config
+        self.sidecar_receiver = None
+        if vllm_config.cornserve_config is not None:
+            # CORNSERVE init siedcar
+            self.sidecar_config = vllm_config.cornserve_config
+            self.sidecar_receiver = TensorSidecarAsyncReceiver(
+                sidecar_rank=self.sidecar_config.sidecars[0],
+                shape=(-1, self.model_config.get_hidden_size()),
+                dtype=self.model_config.dtype,
+            )
 
         self.log_requests = log_requests
         self.log_stats = log_stats
@@ -163,6 +175,18 @@ class AsyncLLM(EngineClient):
             self.output_processor.add_request(request, parent_req, idx, queue)
 
             # 5) Add the EngineCoreRequest to EngineCore (separate process).
+            if self.sidecar_receiver is not None:
+                logger.info("CORNSERVE: waiting for request %s", request_id)
+                # get the data_ids if they exist
+                if request.mm_inputs is not None:
+                    data_ids = request.get_data_ids()
+                    logger.info("CORNSERVE: waiting for data_ids %s", data_ids)
+                    if data_ids:
+                        req_id = request_id.split("-")[-1]
+                        for data_id in data_ids:
+                            logger.info("CORNSERVE: waiting for data_id %s", data_id)
+                            _ = await self.sidecar_receiver.recv(req_id + data_id)
+
             await self.engine_core.add_request_async(request)
 
             if self.log_requests:
@@ -238,6 +262,19 @@ class AsyncLLM(EngineClient):
                 # own request cleanup based on finished.
                 finished = out.finished
                 yield out
+
+            # mark the request done in sidecar
+            if self.sidecar_receiver is not None:
+                if isinstance(prompt, dict) and \
+                'multi_modal_data' in prompt and \
+                'image' in prompt['multi_modal_data'] and \
+                isinstance(prompt['multi_modal_data']['image'], list):
+                    req_id = request_id.split("-")[-1]
+                    logger.info("CORNSERVE: marking transfer done")
+                    for i, data in enumerate(prompt['multi_modal_data']['image']):
+                        if isinstance(data, CornserveData):
+                            id = req_id + data.id
+                            await self.sidecar_receiver.mark_done(id)
 
         # If the request is disconnected by the client, the
         # generate() task will be canceled. So, we abort the

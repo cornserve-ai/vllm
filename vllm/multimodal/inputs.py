@@ -18,6 +18,8 @@ from typing_extensions import NotRequired, TypeAlias
 
 from vllm.utils import JSONTree, full_groupby, is_list_of, json_map_leaves
 
+from dataclasses import replace
+
 if TYPE_CHECKING:
     from .hasher import MultiModalHashDict
 
@@ -193,6 +195,8 @@ class MultiModalFieldElem:
     Defines how to combine the tensor data of this field with others
     in order to batch multi-modal items together for model inference.
     """
+
+    data_id: Optional[str] = None
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
@@ -505,10 +509,20 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
         assert len(modalities) == 1, f"Found different modalities={modalities}"
         return next(iter(modalities))
 
+    def with_data_id(self, data_id: str) -> "MultiModalKwargsItem":
+        """Create a new MultiModalKwargsItem with data_id set for all field elements."""
+        new_elements = {}
+        for key, field_elem in self.items():
+            # Create a new field element with data_id
+            new_elem = replace(field_elem, data_id=data_id)
+            new_elements[key] = new_elem
+        
+        return MultiModalKwargsItem(new_elements)
+
 
 # NOTE: UserDict is for V0 compatibility.
 # V1 should access individual items via `get_item`.
-class MultiModalKwargs(UserDict[str, NestedTensors]):
+class MultiModalKwargs(UserDict[str, NestedTensors | list | dict]):
     """
     A dictionary that represents the keyword arguments to
     :meth:`~torch.nn.Module.forward`.
@@ -556,7 +570,14 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
     def from_items(items: Sequence[MultiModalKwargsItem]):
         """Construct a new :class:`MultiModalKwargs` from multiple items."""
         elems_by_key = defaultdict[str, list[MultiModalFieldElem]](list)
+        data_ids = []
+
         for item in items:
+            # Extract data_id from the first element in the item (if any)
+            if item and any(elem.data_id for elem in item.values()):
+                first_elem = next(iter(item.values()))
+                if first_elem.data_id:
+                    data_ids.append(first_elem.data_id)
             for key, elem in item.items():
                 elems_by_key[key].append(elem)
 
@@ -564,6 +585,10 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
             key: elems[0].field.reduce_data(elems)
             for key, elems in elems_by_key.items() if len(elems) > 0
         }
+
+        # Only add data_ids if we collected any
+        if data_ids:
+            data["data_ids"] = data_ids
 
         return MultiModalKwargs(data, items=items)
 
@@ -636,14 +661,30 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
         # contains different modalities (i.e. different keys).
         item_lists = defaultdict[str, list[NestedTensors]](list)
 
+        # Special handling for data_ids
+        all_data_ids = []
+
         for inputs in inputs_list:
             for k, v in inputs.items():
+                # Special handling for data_ids to avoid trying to stack it
+                if k == "data_ids":
+                    if isinstance(v, (list, tuple)):
+                        all_data_ids.extend(v)
+                    else:
+                        all_data_ids.append(v)
+                    continue
                 item_lists[k].append(v)
 
-        return {
+        result = {
             k: MultiModalKwargs._try_stack(item_list)
             for k, item_list in item_lists.items()
         }
+
+        # Add data_ids if we collected any
+        if all_data_ids:
+            result["data_ids"] = all_data_ids
+
+        return result
 
     @staticmethod
     def as_kwargs(
@@ -651,14 +692,26 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
         *,
         device: torch.types.Device,
     ) -> BatchedTensorInputs:
-        json_inputs = cast(JSONTree[torch.Tensor], batched_inputs)
-
+        # Copy the inputs dictionary to avoid modifying the original
+        result = {}
+        
+        # Handle special case for data_ids
+        if "data_ids" in batched_inputs:
+            result["data_ids"] = batched_inputs["data_ids"]
+        
+        # Cast remaining items to the specified device
+        json_inputs = {k: v for k, v in batched_inputs.items() if k != "data_ids"}
+        json_inputs = cast(JSONTree[torch.Tensor], json_inputs)
+        
         json_mapped = json_map_leaves(
             lambda x: x.to(device, non_blocking=True),
             json_inputs,
         )
-
-        return cast(BatchedTensorInputs, json_mapped)
+        
+        # Merge the device-moved tensors with the special items
+        result.update(cast(BatchedTensorInputs, json_mapped))
+        
+        return result
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
@@ -692,7 +745,16 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
         its modality and index.
         """
         self._validate_modality("get_item", modality)
-        return self._items_by_modality[modality][item_index]
+        item = self._items_by_modality[modality][item_index]
+        # Check if we have data_ids and the index is valid
+        if "data_ids" in self and isinstance(self["data_ids"], (list, tuple)) and item_index < len(self["data_ids"]):
+            # Get the data_id for this index
+            data_id = self["data_ids"][item_index]
+            
+            # Create a new item with data_id and return it
+            return item.with_data_id(data_id)
+        return item
+
 
     def get_items(self, modality: str) -> Sequence[MultiModalKwargsItem]:
         """
