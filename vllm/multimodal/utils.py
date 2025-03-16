@@ -140,6 +140,8 @@ class MediaConnector:
                 data = await self.connection.async_get_bytes(
                     url, timeout=fetch_timeout)
                 return CornserveData(id=uuid, data=media_io.load_bytes(data))
+            elif url_spec.path.startswith("video/uuid;"):
+                pass
             return self._load_data_url(url_spec, media_io)
 
         if url_spec.scheme == "file":
