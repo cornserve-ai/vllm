@@ -87,12 +87,17 @@ from vllm.utils import (FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address, set_ulimit)
 from vllm.version import __version__ as VLLM_VERSION
 
+from cornserve.services.otel import configure_otel
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry import trace
+
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
 logger = init_logger('vllm.entrypoints.openai.api_server')
+tracer = trace.get_tracer(__name__)
 
 _running_tasks: set[asyncio.Task] = set()
 
@@ -402,12 +407,13 @@ async def show_version():
 @with_cancellation
 async def create_chat_completion(request: ChatCompletionRequest,
                                  raw_request: Request):
-    handler = chat(raw_request)
-    if handler is None:
-        return base(raw_request).create_error_response(
-            message="The model does not support Chat Completions API")
+    with tracer.start_as_current_span("create_chat_completion"):
+        handler = chat(raw_request)
+        if handler is None:
+            return base(raw_request).create_error_response(
+                message="The model does not support Chat Completions API")
 
-    generator = await handler.create_chat_completion(request, raw_request)
+        generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
@@ -944,8 +950,17 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
+    if hasattr(args, "cornserve_sidecar_ranks"):
+        logger.info("Configuring OpenTelemetry with cornserve sidecar ranks")
+        configure_otel(f"vLLM-{args.cornserve_sidecar_ranks}")
+    else:
+        logger.info("Configuring OpenTelemetry with native vLLM")
+        configure_otel("vLLM")
+
     async with build_async_engine_client(args) as engine_client:
         app = build_app(args)
+
+        FastAPIInstrumentor().instrument_app(app)
 
         model_config = await engine_client.get_model_config()
         await init_app_state(engine_client, model_config, app.state, args)

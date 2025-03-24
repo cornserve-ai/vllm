@@ -38,7 +38,10 @@ from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids)
 
+from opentelemetry import trace
+
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -127,149 +130,151 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
-        error_check_ret = await self._check_model(request)
-        if error_check_ret is not None:
-            logger.error("Error with model %s", error_check_ret)
-            return error_check_ret
+        with tracer.start_as_current_span("create_chat_completion") as span:
+            error_check_ret = await self._check_model(request)
+            if error_check_ret is not None:
+                logger.error("Error with model %s", error_check_ret)
+                return error_check_ret
 
-        # If the engine is dead, raise the engine's DEAD_ERROR.
-        # This is required for the streaming case, where we return a
-        # success status before we actually start generating text :).
-        if self.engine_client.errored:
-            raise self.engine_client.dead_error
+            # If the engine is dead, raise the engine's DEAD_ERROR.
+            # This is required for the streaming case, where we return a
+            # success status before we actually start generating text :).
+            if self.engine_client.errored:
+                raise self.engine_client.dead_error
 
-        try:
-            (
-                lora_request,
-                prompt_adapter_request,
-            ) = self._maybe_get_adapters(request)
+            try:
+                (
+                    lora_request,
+                    prompt_adapter_request,
+                ) = self._maybe_get_adapters(request)
 
-            model_name = self._get_model_name(request.model, lora_request)
+                model_name = self._get_model_name(request.model, lora_request)
 
-            tokenizer = await self.engine_client.get_tokenizer(lora_request)
+                tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
-            tool_parser = self.tool_parser
+                tool_parser = self.tool_parser
 
-            # validation for OpenAI tools
-            # tool_choice = "required" is not supported
-            if request.tool_choice == "required":
-                return self.create_error_response(
-                    "tool_choice = \"required\" is not supported!")
+                # validation for OpenAI tools
+                # tool_choice = "required" is not supported
+                if request.tool_choice == "required":
+                    return self.create_error_response(
+                        "tool_choice = \"required\" is not supported!")
 
-            if isinstance(tokenizer, MistralTokenizer):
-                # because of issues with pydantic we need to potentially
-                # re-serialize the tool_calls field of the request
-                # for more info: see comment in `maybe_serialize_tool_calls`
-                maybe_serialize_tool_calls(request)
-                truncate_tool_call_ids(request)
+                if isinstance(tokenizer, MistralTokenizer):
+                    # because of issues with pydantic we need to potentially
+                    # re-serialize the tool_calls field of the request
+                    # for more info: see comment in `maybe_serialize_tool_calls`
+                    maybe_serialize_tool_calls(request)
+                    truncate_tool_call_ids(request)
 
-            if (request.tool_choice == "auto" and
-                    not (self.enable_auto_tools and tool_parser is not None)
-                    and not isinstance(tokenizer, MistralTokenizer)):
-                # for hf tokenizers, "auto" tools requires
-                # --enable-auto-tool-choice and --tool-call-parser
-                return self.create_error_response(
-                    "\"auto\" tool choice requires "
-                    "--enable-auto-tool-choice and --tool-call-parser to be set"
+                if (request.tool_choice == "auto" and
+                        not (self.enable_auto_tools and tool_parser is not None)
+                        and not isinstance(tokenizer, MistralTokenizer)):
+                    # for hf tokenizers, "auto" tools requires
+                    # --enable-auto-tool-choice and --tool-call-parser
+                    return self.create_error_response(
+                        "\"auto\" tool choice requires "
+                        "--enable-auto-tool-choice and --tool-call-parser to be set"
+                    )
+
+                tool_dicts = None if request.tools is None else [
+                    tool.model_dump() for tool in request.tools
+                ]
+
+                (
+                    conversation,
+                    request_prompts,
+                    engine_prompts,
+                ) = await self._preprocess_chat(
+                    request,
+                    tokenizer,
+                    request.messages,
+                    chat_template=request.chat_template or self.chat_template,
+                    chat_template_content_format=self.chat_template_content_format,
+                    add_generation_prompt=request.add_generation_prompt,
+                    continue_final_message=request.continue_final_message,
+                    tool_dicts=tool_dicts,
+                    documents=request.documents,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    tool_parser=tool_parser,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
+                    add_special_tokens=request.add_special_tokens,
                 )
+            except ValueError as e:
+                logger.exception("Error in preprocessing prompt inputs")
+                return self.create_error_response(str(e))
 
-            tool_dicts = None if request.tools is None else [
-                tool.model_dump() for tool in request.tools
-            ]
+            span.add_event("preprocess_chat done")
+            request_id = "chatcmpl-" \
+                         f"{self._base_request_id(raw_request, request.request_id)}"
 
-            (
-                conversation,
-                request_prompts,
-                engine_prompts,
-            ) = await self._preprocess_chat(
-                request,
-                tokenizer,
-                request.messages,
-                chat_template=request.chat_template or self.chat_template,
-                chat_template_content_format=self.chat_template_content_format,
-                add_generation_prompt=request.add_generation_prompt,
-                continue_final_message=request.continue_final_message,
-                tool_dicts=tool_dicts,
-                documents=request.documents,
-                chat_template_kwargs=request.chat_template_kwargs,
-                tool_parser=tool_parser,
-                truncate_prompt_tokens=request.truncate_prompt_tokens,
-                add_special_tokens=request.add_special_tokens,
-            )
-        except ValueError as e:
-            logger.exception("Error in preprocessing prompt inputs")
-            return self.create_error_response(str(e))
+            request_metadata = RequestResponseMetadata(request_id=request_id)
+            if raw_request:
+                raw_request.state.request_metadata = request_metadata
 
-        request_id = "chatcmpl-" \
-                     f"{self._base_request_id(raw_request, request.request_id)}"
+            # Schedule the request and get the result generator.
+            generators: list[AsyncGenerator[RequestOutput, None]] = []
+            try:
+                for i, engine_prompt in enumerate(engine_prompts):
+                    sampling_params: Union[SamplingParams, BeamSearchParams]
+                    default_max_tokens = self.max_model_len - len(
+                        engine_prompt["prompt_token_ids"])
+                    if request.use_beam_search:
+                        sampling_params = request.to_beam_search_params(
+                            default_max_tokens, self.default_sampling_params)
+                    else:
+                        sampling_params = request.to_sampling_params(
+                            default_max_tokens,
+                            self.model_config.logits_processor_pattern,
+                            self.default_sampling_params)
 
-        request_metadata = RequestResponseMetadata(request_id=request_id)
-        if raw_request:
-            raw_request.state.request_metadata = request_metadata
+                    self._log_inputs(request_id,
+                                     request_prompts[i],
+                                     params=sampling_params,
+                                     lora_request=lora_request,
+                                     prompt_adapter_request=prompt_adapter_request)
 
-        # Schedule the request and get the result generator.
-        generators: list[AsyncGenerator[RequestOutput, None]] = []
-        try:
-            for i, engine_prompt in enumerate(engine_prompts):
-                sampling_params: Union[SamplingParams, BeamSearchParams]
-                default_max_tokens = self.max_model_len - len(
-                    engine_prompt["prompt_token_ids"])
-                if request.use_beam_search:
-                    sampling_params = request.to_beam_search_params(
-                        default_max_tokens, self.default_sampling_params)
-                else:
-                    sampling_params = request.to_sampling_params(
-                        default_max_tokens,
-                        self.model_config.logits_processor_pattern,
-                        self.default_sampling_params)
+                    trace_headers = (None if raw_request is None else await
+                                     self._get_trace_headers(raw_request.headers))
 
-                self._log_inputs(request_id,
-                                 request_prompts[i],
-                                 params=sampling_params,
-                                 lora_request=lora_request,
-                                 prompt_adapter_request=prompt_adapter_request)
+                    if isinstance(sampling_params, BeamSearchParams):
+                        generator = self.engine_client.beam_search(
+                            prompt=engine_prompt,
+                            request_id=request_id,
+                            params=sampling_params,
+                        )
+                    else:
+                        generator = self.engine_client.generate(
+                            engine_prompt,
+                            sampling_params,
+                            request_id,
+                            lora_request=lora_request,
+                            trace_headers=trace_headers,
+                            prompt_adapter_request=prompt_adapter_request,
+                            priority=request.priority,
+                        )
 
-                trace_headers = (None if raw_request is None else await
-                                 self._get_trace_headers(raw_request.headers))
+                    generators.append(generator)
+            except ValueError as e:
+                # TODO: Use a vllm-specific Validation Error
+                return self.create_error_response(str(e))
 
-                if isinstance(sampling_params, BeamSearchParams):
-                    generator = self.engine_client.beam_search(
-                        prompt=engine_prompt,
-                        request_id=request_id,
-                        params=sampling_params,
-                    )
-                else:
-                    generator = self.engine_client.generate(
-                        engine_prompt,
-                        sampling_params,
-                        request_id,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                        prompt_adapter_request=prompt_adapter_request,
-                        priority=request.priority,
-                    )
+            assert len(generators) == 1
+            result_generator, = generators
 
-                generators.append(generator)
-        except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            # Streaming response
+            if request.stream:
+                return self.chat_completion_stream_generator(
+                    request, result_generator, request_id, model_name,
+                    conversation, tokenizer, request_metadata)
 
-        assert len(generators) == 1
-        result_generator, = generators
-
-        # Streaming response
-        if request.stream:
-            return self.chat_completion_stream_generator(
-                request, result_generator, request_id, model_name,
-                conversation, tokenizer, request_metadata)
-
-        try:
-            return await self.chat_completion_full_generator(
-                request, result_generator, request_id, model_name,
-                conversation, tokenizer, request_metadata)
-        except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            try:
+                return await self.chat_completion_full_generator(
+                    request, result_generator, request_id, model_name,
+                    conversation, tokenizer, request_metadata)
+            except ValueError as e:
+                # TODO: Use a vllm-specific Validation Error
+                return self.create_error_response(str(e))
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:

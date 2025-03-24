@@ -35,8 +35,11 @@ from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 from vllm.multimodal.utils import CornserveData
 from cornserve.services.sidecar.api import TensorSidecarAsyncReceiver
+from opentelemetry import trace
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class AsyncLLM(EngineClient):
@@ -65,6 +68,7 @@ class AsyncLLM(EngineClient):
                 shape=(-1, self.model_config.get_hidden_size()),
                 dtype=self.model_config.dtype,
             )
+        self.propagator = TraceContextTextMapPropagator()
 
         self.log_requests = log_requests
         self.log_stats = log_stats
@@ -153,46 +157,51 @@ class AsyncLLM(EngineClient):
         priority: int = 0,
     ) -> asyncio.Queue[RequestOutput]:
         """Add new request to the AsyncLLM."""
+        with tracer.start_as_current_span("add_request") as span:
 
-        # 1) Create a new output queue for the request.
-        queue: asyncio.Queue[RequestOutput] = asyncio.Queue()
+            # 1) Create a new output queue for the request.
+            queue: asyncio.Queue[RequestOutput] = asyncio.Queue()
 
-        # 2) Fan out child requests (for n>1)
-        parent_req = ParentRequest.from_params(request_id, params)
-        n = params.n if isinstance(params, SamplingParams) else 1
-        for idx in range(n):
-            if parent_req is not None:
-                request_id, params = parent_req.get_child_info(idx)
+            # 2) Fan out child requests (for n>1)
+            parent_req = ParentRequest.from_params(request_id, params)
+            n = params.n if isinstance(params, SamplingParams) else 1
+            for idx in range(n):
+                if parent_req is not None:
+                    request_id, params = parent_req.get_child_info(idx)
 
-            # 3) Convert Input --> Request.
-            request = self.processor.process_inputs(request_id, prompt, params,
-                                                    arrival_time, lora_request,
-                                                    trace_headers,
-                                                    prompt_adapter_request,
-                                                    priority)
+                # 3) Convert Input --> Request.
+                request = self.processor.process_inputs(request_id, prompt, params,
+                                                        arrival_time, lora_request,
+                                                        trace_headers,
+                                                        prompt_adapter_request,
+                                                        priority)
+                # carrier = {}
+                # self.propagator.inject(carrier)
+                # request.otel_context = carrier
 
-            # 4) Add the request to OutputProcessor (this process).
-            self.output_processor.add_request(request, parent_req, idx, queue)
+                # 4) Add the request to OutputProcessor (this process).
+                self.output_processor.add_request(request, parent_req, idx, queue)
 
-            # 5) Add the EngineCoreRequest to EngineCore (separate process).
-            if self.sidecar_receiver is not None:
-                logger.info("CORNSERVE: waiting for request %s", request_id)
-                # get the data_ids if they exist
-                if request.mm_inputs is not None:
-                    data_ids = request.get_data_ids()
-                    logger.info("CORNSERVE: waiting for data_ids %s", data_ids)
-                    if data_ids:
-                        req_id = request_id.split("-")[-1]
-                        for data_id in data_ids:
-                            logger.info("CORNSERVE: waiting for data_id %s", data_id)
-                            _ = await self.sidecar_receiver.recv(req_id + data_id)
+                # 5) Add the EngineCoreRequest to EngineCore (separate process).
+                if self.sidecar_receiver is not None:
+                    logger.info("CORNSERVE: waiting for request %s", request_id)
+                    # get the data_ids if they exist
+                    if request.mm_inputs is not None:
+                        data_ids = request.get_data_ids()
+                        logger.info("CORNSERVE: waiting for data_ids %s", data_ids)
+                        if data_ids:
+                            req_id = request_id.split("-")[-1]
+                            for data_id in data_ids:
+                                logger.info("CORNSERVE: waiting for data_id %s", data_id)
+                                _ = await self.sidecar_receiver.recv(req_id + data_id)
+                                span.add_event(f"vLLM receive {req_id+data_id}")
 
-            await self.engine_core.add_request_async(request)
+                await self.engine_core.add_request_async(request)
 
-            if self.log_requests:
-                logger.info("Added request %s.", request_id)
+                if self.log_requests:
+                    logger.info("Added request %s.", request_id)
 
-        return queue
+            return queue
 
     # TODO: we should support multiple prompts in one call, as you
     # can do with LLM.generate. So that for multi-prompt completion
@@ -223,65 +232,65 @@ class AsyncLLM(EngineClient):
         The caller of generate() iterates the returned AsyncGenerator,
         returning the RequestOutput back to the caller.
         """
+        with tracer.start_as_current_span("generate"):
+            try:
+                # We start the output_handler on the first call to generate() so
+                # we can call __init__ before the event loop, which enables us
+                # to handle startup failure gracefully in the OpenAI server.
+                if self.output_handler is None:
+                    self.output_handler = asyncio.create_task(
+                        self._run_output_handler())
 
-        try:
-            # We start the output_handler on the first call to generate() so
-            # we can call __init__ before the event loop, which enables us
-            # to handle startup failure gracefully in the OpenAI server.
-            if self.output_handler is None:
-                self.output_handler = asyncio.create_task(
-                    self._run_output_handler())
+                q = await self.add_request(
+                    request_id,
+                    prompt,
+                    sampling_params,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    prompt_adapter_request=prompt_adapter_request,
+                    priority=priority,
+                )
 
-            q = await self.add_request(
-                request_id,
-                prompt,
-                sampling_params,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                prompt_adapter_request=prompt_adapter_request,
-                priority=priority,
-            )
+                # The output_handler task pushes items into the queue.
+                # This task pulls from the queue and yields to caller.
+                finished = False
+                while not finished:
+                    # Note: drain queue without await if possible (avoids
+                    # task switching under load which helps performance).
+                    out = q.get_nowait() if not q.empty() else await q.get()
 
-            # The output_handler task pushes items into the queue.
-            # This task pulls from the queue and yields to caller.
-            finished = False
-            while not finished:
-                # Note: drain queue without await if possible (avoids
-                # task switching under load which helps performance).
-                out = q.get_nowait() if not q.empty() else await q.get()
+                    # Coalesce any additional queued outputs
+                    while not q.empty():
+                        next_out = q.get_nowait()
+                        if sampling_params.output_kind == RequestOutputKind.DELTA:
+                            out.add(next_out)
+                        else:
+                            out = next_out
 
-                # Coalesce any additional queued outputs
-                while not q.empty():
-                    next_out = q.get_nowait()
-                    if sampling_params.output_kind == RequestOutputKind.DELTA:
-                        out.add(next_out)
-                    else:
-                        out = next_out
+                    # Note: both OutputProcessor and EngineCore handle their
+                    # own request cleanup based on finished.
+                    finished = out.finished
+                    yield out
 
-                # Note: both OutputProcessor and EngineCore handle their
-                # own request cleanup based on finished.
-                finished = out.finished
-                yield out
+                # mark the request done in sidecar
+                if self.sidecar_receiver is not None:
+                    if isinstance(prompt, dict) and \
+                    'multi_modal_data' in prompt and \
+                    'image' in prompt['multi_modal_data'] and \
+                    isinstance(prompt['multi_modal_data']['image'], list):
+                        req_id = request_id.split("-")[-1]
+                        logger.info("CORNSERVE: marking transfer done")
+                        for i, data in enumerate(prompt['multi_modal_data']['image']):
+                            if isinstance(data, CornserveData):
+                                id = req_id + data.id
+                                await self.sidecar_receiver.mark_done(id)
 
-            # mark the request done in sidecar
-            if self.sidecar_receiver is not None:
-                if isinstance(prompt, dict) and \
-                'multi_modal_data' in prompt and \
-                'image' in prompt['multi_modal_data'] and \
-                isinstance(prompt['multi_modal_data']['image'], list):
-                    req_id = request_id.split("-")[-1]
-                    logger.info("CORNSERVE: marking transfer done")
-                    for i, data in enumerate(prompt['multi_modal_data']['image']):
-                        if isinstance(data, CornserveData):
-                            id = req_id + data.id
-                            await self.sidecar_receiver.mark_done(id)
-
-        # If the request is disconnected by the client, the
-        # generate() task will be canceled. So, we abort the
-        # request if we end up here.
-        except asyncio.CancelledError:
-            await self.abort(request_id)
-            raise
+            # If the request is disconnected by the client, the
+            # generate() task will be canceled. So, we abort the
+            # request if we end up here.
+            except asyncio.CancelledError:
+                await self.abort(request_id)
+                raise
 
     async def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
