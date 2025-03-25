@@ -31,6 +31,7 @@ class Request:
         arrival_time: float,
         lora_request: Optional["LoRARequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
+        otel_context: Optional[dict] = None,
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
@@ -59,6 +60,7 @@ class Request:
         self.mm_positions = multi_modal_placeholders or []
         self.mm_inputs = multi_modal_inputs or []
         self.mm_hashes: list[str] = multi_modal_hashes or []
+        self.otel_context = otel_context
 
         # Sanity check
         assert len(self.mm_inputs) == len(self.mm_positions)
@@ -86,6 +88,7 @@ class Request:
             lora_request=request.lora_request,
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params),
+            otel_context=request.otel_context,
         )
 
     def queued(self, timestamp: Optional[float] = None) -> None:

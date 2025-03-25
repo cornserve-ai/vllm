@@ -87,12 +87,17 @@ from vllm.utils import (FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address, set_ulimit)
 from vllm.version import __version__ as VLLM_VERSION
 
+from cornserve.tracing import configure_otel
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry import trace
+
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
 logger = init_logger('vllm.entrypoints.openai.api_server')
+tracer = trace.get_tracer(__name__)
 
 _running_tasks: set[asyncio.Task] = set()
 
@@ -400,6 +405,7 @@ async def show_version():
 @router.post("/v1/chat/completions",
              dependencies=[Depends(validate_json_request)])
 @with_cancellation
+@tracer.start_as_current_span(name="vLLM-create_chat_completion")
 async def create_chat_completion(request: ChatCompletionRequest,
                                  raw_request: Request):
     handler = chat(raw_request)
@@ -944,8 +950,14 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, signal_handler)
 
+    if args.cornserve_sidecar_ranks:
+        logger.info("Configuring OpenTelemetry with cornserve sidecar ranks")
+        configure_otel(f"vLLM{str(args.cornserve_sidecar_ranks).replace(' ', '')}")
+
     async with build_async_engine_client(args) as engine_client:
         app = build_app(args)
+
+        FastAPIInstrumentor().instrument_app(app)
 
         model_config = await engine_client.get_model_config()
         await init_app_state(engine_client, model_config, app.state, args)

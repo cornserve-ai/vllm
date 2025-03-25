@@ -35,8 +35,12 @@ from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 from vllm.multimodal.utils import CornserveData
 from cornserve.services.sidecar.api import TensorSidecarAsyncReceiver
+from opentelemetry import trace, propagate
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
+PROPAGATOR = propagate.get_global_textmap()
 
 
 class AsyncLLM(EngineClient):
@@ -141,6 +145,7 @@ class AsyncLLM(EngineClient):
         if handler := getattr(self, "output_handler", None):
             handler.cancel()
 
+    @tracer.start_as_current_span(name="vLLM-add_request")
     async def add_request(
         self,
         request_id: str,
@@ -154,6 +159,7 @@ class AsyncLLM(EngineClient):
     ) -> asyncio.Queue[RequestOutput]:
         """Add new request to the AsyncLLM."""
 
+        span = trace.get_current_span()
         # 1) Create a new output queue for the request.
         queue: asyncio.Queue[RequestOutput] = asyncio.Queue()
 
@@ -170,6 +176,9 @@ class AsyncLLM(EngineClient):
                                                     trace_headers,
                                                     prompt_adapter_request,
                                                     priority)
+            carrier = {}
+            PROPAGATOR.inject(carrier)
+            request.otel_context = carrier
 
             # 4) Add the request to OutputProcessor (this process).
             self.output_processor.add_request(request, parent_req, idx, queue)
@@ -186,6 +195,7 @@ class AsyncLLM(EngineClient):
                         for data_id in data_ids:
                             logger.info("CORNSERVE: waiting for data_id %s", data_id)
                             _ = await self.sidecar_receiver.recv(req_id + data_id)
+                            span.add_event(f"vLLM receive {req_id+data_id}")
 
             await self.engine_core.add_request_async(request)
 
@@ -223,7 +233,6 @@ class AsyncLLM(EngineClient):
         The caller of generate() iterates the returned AsyncGenerator,
         returning the RequestOutput back to the caller.
         """
-
         try:
             # We start the output_handler on the first call to generate() so
             # we can call __init__ before the event loop, which enables us
@@ -271,7 +280,7 @@ class AsyncLLM(EngineClient):
                 isinstance(prompt['multi_modal_data']['image'], list):
                     req_id = request_id.split("-")[-1]
                     logger.info("CORNSERVE: marking transfer done")
-                    for i, data in enumerate(prompt['multi_modal_data']['image']):
+                    for _, data in enumerate(prompt['multi_modal_data']['image']):
                         if isinstance(data, CornserveData):
                             id = req_id + data.id
                             await self.sidecar_receiver.mark_done(id)

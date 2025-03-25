@@ -59,6 +59,7 @@ class EngineCoreRequest(
     eos_token_id: Optional[int]
     arrival_time: float
     lora_request: Optional[LoRARequest]
+    otel_context: Optional[dict]
 
     def get_data_ids(self) -> list:
         data_ids = []
