@@ -21,8 +21,11 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
+from opentelemetry import trace, propagate
 
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
+PROPAGATOR = propagate.get_global_textmap()
 
 
 class Scheduler:
@@ -401,6 +404,23 @@ class Scheduler:
                 resumed_from_preemption=False,
             ) for req in scheduled_running_reqs
         ]
+        for request in scheduled_new_reqs:
+            if request.otel_context:
+                span_context = PROPAGATOR.extract(request.otel_context)
+                with tracer.start_as_current_span("New scheduled", context=span_context) as span:
+                    span.set_attribute("request_id", request.request_id)
+                    new_context = {}
+                    PROPAGATOR.inject(new_context)
+                    request.otel_context = new_context
+        for request in scheduled_resumed_reqs:
+            if request.otel_context:
+                span_context = PROPAGATOR.extract(request.otel_context)
+                with tracer.start_as_current_span("Resume", context=span_context) as span:
+                    span.set_attribute("request_id", request.request_id)
+                    new_context = {}
+                    PROPAGATOR.inject(new_context)
+                    request.otel_context = new_context
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=resumed_reqs_data + running_reqs_data,

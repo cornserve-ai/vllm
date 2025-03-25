@@ -31,8 +31,12 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
+from cornserve.tracing import configure_otel
+from opentelemetry import trace, propagate
 
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
+PROPAGATOR = propagate.get_global_textmap()
 
 POLLING_TIMEOUT_S = 2.5
 
@@ -48,6 +52,8 @@ class EngineCore:
     ):
         assert vllm_config.model_config.runner_type != "pooling"
 
+        if vllm_config.cornserve_config:
+            configure_otel(f"vLLM{str(vllm_config.cornserve_config.sidecars).replace(' ', '')}")
         logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
                     VLLM_VERSION, vllm_config)
 
@@ -133,6 +139,14 @@ class EngineCore:
             assert request.mm_inputs is not None
             request.mm_inputs = self.mm_input_cache_server.get_and_update(
                 request.mm_inputs, request.mm_hashes)
+
+        if request.otel_context:
+            span_context = PROPAGATOR.extract(request.otel_context)
+            with tracer.start_as_current_span("engine enqueue", context=span_context) as span:
+                span.set_attribute("request_id", request.request_id)
+                new_context = {}
+                PROPAGATOR.inject(new_context)
+                request.otel_context = new_context
 
         req = Request.from_engine_core_request(request)
         if req.use_structured_output:

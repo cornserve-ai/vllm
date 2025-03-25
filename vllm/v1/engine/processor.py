@@ -291,6 +291,7 @@ class Processor:
             eos_token_id=eos_token_id,
             arrival_time=arrival_time,
             lora_request=lora_request,
+            otel_context=None,
         )
 
     def _validate_model_inputs(self, inputs: ProcessorInputs):
