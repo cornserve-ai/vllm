@@ -9,12 +9,20 @@ from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
+from opentelemetry import trace, propagate
+from vllm.logger import init_logger
+
+tracer = trace.get_tracer(__name__)
+propagator = propagate.get_global_textmap()
+
 if TYPE_CHECKING:
 
     from vllm.lora.request import LoRARequest
     from vllm.multimodal import MultiModalKwargs
     from vllm.multimodal.inputs import PlaceholderRange
+    from opentelemetry.trace import Span
 
+logger = init_logger(__name__)
 
 class Request:
 
@@ -31,7 +39,6 @@ class Request:
         arrival_time: float,
         lora_request: Optional["LoRARequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
-        otel_context: Optional[dict] = None,
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
@@ -60,7 +67,7 @@ class Request:
         self.mm_positions = multi_modal_placeholders or []
         self.mm_inputs = multi_modal_inputs or []
         self.mm_hashes: list[str] = multi_modal_hashes or []
-        self.otel_context = otel_context
+        self.span: Span | None = None
 
         # Sanity check
         assert len(self.mm_inputs) == len(self.mm_positions)
@@ -88,7 +95,6 @@ class Request:
             lora_request=request.lora_request,
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params),
-            otel_context=request.otel_context,
         )
 
     def queued(self, timestamp: Optional[float] = None) -> None:

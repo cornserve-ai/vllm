@@ -36,7 +36,7 @@ from opentelemetry import trace, propagate
 
 logger = init_logger(__name__)
 tracer = trace.get_tracer(__name__)
-PROPAGATOR = propagate.get_global_textmap()
+propagator = propagate.get_global_textmap()
 
 POLLING_TIMEOUT_S = 2.5
 
@@ -140,15 +140,16 @@ class EngineCore:
             request.mm_inputs = self.mm_input_cache_server.get_and_update(
                 request.mm_inputs, request.mm_hashes)
 
-        if request.otel_context:
-            span_context = PROPAGATOR.extract(request.otel_context)
-            with tracer.start_as_current_span("engine enqueue", context=span_context) as span:
-                span.set_attribute("request_id", request.request_id)
-                new_context = {}
-                PROPAGATOR.inject(new_context)
-                request.otel_context = new_context
-
+        logger.info("Adding request: %s", request.otel_carrier)
         req = Request.from_engine_core_request(request)
+        if request.otel_carrier:
+            span_context = propagator.extract(request.otel_carrier)
+            logger.info("Extracted span context: %s", span_context)
+            span = tracer.start_span("EngineCore.add_request", context=span_context)
+            logger.info("span created for request %s", span)
+            span.set_attribute("max_tokens", req.max_tokens)
+            req.span = span
+
         if req.use_structured_output:
             # Start grammar compilation asynchronously
             self.structured_output_manager.populate_cache(req)
