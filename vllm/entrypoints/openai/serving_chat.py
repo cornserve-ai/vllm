@@ -150,7 +150,9 @@ class OpenAIServingChat(OpenAIServing):
 
             model_name = self._get_model_name(request.model, lora_request)
 
+            span.add_event("get_tokenizer.start")
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
+            span.add_event("get_tokenizer.done")
 
             tool_parser = self.tool_parser
 
@@ -181,6 +183,7 @@ class OpenAIServingChat(OpenAIServing):
                 tool.model_dump() for tool in request.tools
             ]
 
+            span.add_event("preprocess_chat.start")
             (
                 conversation,
                 request_prompts,
@@ -204,7 +207,7 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
 
-        span.add_event("preprocess_chat done")
+        span.add_event("preprocess_chat.done")
         request_id = "chatcmpl-" \
                      f"{self._base_request_id(raw_request, request.request_id)}"
 
