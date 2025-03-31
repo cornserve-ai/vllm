@@ -1109,6 +1109,15 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                 else:
                     patched_images.append(d)
             processor_data = {**processor_data, 'images': patched_images}
+        if 'videos' in processor_data and isinstance(processor_data['videos'], list):
+            patched_videos = []
+            for d in processor_data['videos']:
+                if isinstance(d, CornserveData):
+                    patched_videos.append(d.data)
+                    patched_data_ids.append(d.id)
+                else:
+                    patched_videos.append(d)
+            processor_data = {**processor_data, 'videos': patched_videos}
 
         processed_data = self._call_hf_processor(
             prompt=prompt_text,

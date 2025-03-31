@@ -230,6 +230,8 @@ class VideoProcessorItems(ProcessorBatchItems[HfVideoItem]):
         if isinstance(image, (np.ndarray, torch.Tensor)):
             _, h, w = image.shape
             return ImageSize(w, h)
+        if isinstance(image, CornserveData):
+            return ImageSize(*image.data.size)
 
         assert_never(image)
 
