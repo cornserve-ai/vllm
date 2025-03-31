@@ -140,6 +140,15 @@ class MediaConnector:
                 data = await self.connection.async_get_bytes(
                     url, timeout=fetch_timeout)
                 return CornserveData(id=uuid, data=media_io.load_bytes(data))
+            if url_spec.path.startswith("video/uuid;"):
+                # url = f"data:video/uuid;data_id={uuid.uuid4().hex};url={url},"
+                full_str = url_spec.path.replace("video/uuid;", "")
+                uuid = full_str.split(";")[0].replace("data_id=", "")
+                url = full_str.split(";")[1].replace("url=", "")[:-1]
+                # assumes HTTP(s)
+                data = await self.connection.async_get_bytes(
+                    url, timeout=fetch_timeout)
+                return CornserveData(id=uuid, data=media_io.load_bytes(data))
             return self._load_data_url(url_spec, media_io)
 
         if url_spec.scheme == "file":
@@ -242,7 +251,7 @@ class MediaConnector:
         *,
         image_mode: str = "RGB",
         num_frames: int = 32,
-    ) -> npt.NDArray:
+    ) -> npt.NDArray | CornserveData:
         """
         Asynchronously load video from a HTTP or base64 data URL.
 
