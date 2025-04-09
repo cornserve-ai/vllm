@@ -34,7 +34,7 @@ from vllm.v1.metrics.loggers import (LoggingStatLogger, PrometheusStatLogger,
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 from vllm.multimodal.utils import CornserveData
-from cornserve.services.sidecar.api import TensorSidecarAsyncReceiver
+from cornserve.sidecar.api import TensorSidecarAsyncReceiver
 from opentelemetry import trace, propagate
 
 logger = init_logger(__name__)

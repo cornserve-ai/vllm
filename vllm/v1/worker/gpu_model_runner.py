@@ -40,7 +40,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from cornserve.services.sidecar.api import TensorSidecarReceiverExecutor
+from cornserve.sidecar.api import TensorSidecarReceiverExecutor
 
 if TYPE_CHECKING:
     import xgrammar as xgr
