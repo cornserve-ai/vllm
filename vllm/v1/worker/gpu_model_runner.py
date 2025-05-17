@@ -40,7 +40,8 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from cornserve.sidecar.api import TensorSidecarReceiverExecutor
+from cornserve.sidecar.api import Sidecar
+from cornserve.sidecar.schema import SidecarConfig
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -104,11 +105,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.sidecar_reader = None
         if self.cornserve_config:
-            self.sidecar_reader = TensorSidecarReceiverExecutor(
-                self.cornserve_config.sidecars[0],
-                (-1, self.hidden_size),
-                self.dtype,
+            self.sidecar_reader = Sidecar(
+                SidecarConfig(
+                    sidecar_rank= self.cornserve_config.sidecars[0],
+                    group = self.cornserve_config.sidecars,
+                    recv_tensor_shape = (-1, self.hidden_size),
+                    recv_tensor_dtype = self.dtype,
+
                 )
+            )
 
         self.attn_backend = get_attn_backend(
             self.head_size,
@@ -807,11 +812,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
                 if "data_ids" in req_state.mm_inputs[input_id] and len(req_state.mm_inputs[input_id]["data_ids"]) > 0:
                     data_id = req_state.mm_inputs[input_id]["data_ids"][0]
-                    id = req_id.split("-")[-1] + str(data_id)
+                    id = str(data_id)
                     logger.info("CORNSERVE trying to read %s", id)
                     received_num_tokens = 0
                     if self.sidecar_reader:
-                        output = self.sidecar_reader.recv(id).to(self.device)
+                        output = self.sidecar_reader.read(id).to(self.device)
                         received_num_tokens = output.size(0)
                         logger.info("CORNSERVE expecting %d received %d", num_tokens, received_num_tokens)
                         if output.size(0) == num_tokens:
