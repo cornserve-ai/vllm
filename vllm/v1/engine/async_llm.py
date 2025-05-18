@@ -34,7 +34,8 @@ from vllm.v1.metrics.loggers import (LoggingStatLogger, PrometheusStatLogger,
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 from vllm.multimodal.utils import CornserveData
-from cornserve.sidecar.api import TensorSidecarAsyncReceiver
+from cornserve.sidecar.api import Sidecar
+from cornserve.sidecar.schema import SidecarConfig
 from opentelemetry import trace, propagate
 
 logger = init_logger(__name__)
@@ -63,10 +64,13 @@ class AsyncLLM(EngineClient):
         if vllm_config.cornserve_config is not None:
             # CORNSERVE init siedcar
             self.sidecar_config = vllm_config.cornserve_config
-            self.sidecar_receiver = TensorSidecarAsyncReceiver(
-                sidecar_rank=self.sidecar_config.sidecars[0],
-                shape=(-1, self.model_config.get_hidden_size()),
-                dtype=self.model_config.dtype,
+            self.sidecar_receiver = Sidecar(
+                SidecarConfig(
+                    sidecar_rank=self.sidecar_config.sidecars[0],
+                    group=self.sidecar_config.sidecars,
+                    recv_tensor_shape=(-1, self.model_config.get_hidden_size()),
+                    recv_tensor_dtype=self.model_config.dtype,
+                )
             )
 
         self.log_requests = log_requests
@@ -190,10 +194,9 @@ class AsyncLLM(EngineClient):
                     data_ids = request.get_data_ids()
                     logger.info("CORNSERVE: waiting for data_ids %s", data_ids)
                     if data_ids:
-                        req_id = request_id.split("-")[-1]
                         for data_id in data_ids:
                             logger.info("CORNSERVE: waiting for data_id %s", data_id)
-                            _ = await self.sidecar_receiver.recv(req_id + data_id)
+                            _ = await self.sidecar_receiver.recv(data_id)
 
             carrier = {}
             propagator.inject(carrier)
@@ -280,12 +283,10 @@ class AsyncLLM(EngineClient):
                 'multi_modal_data' in prompt and \
                 'image' in prompt['multi_modal_data'] and \
                 isinstance(prompt['multi_modal_data']['image'], list):
-                    req_id = request_id.split("-")[-1]
                     logger.info("CORNSERVE: marking transfer done")
                     for _, data in enumerate(prompt['multi_modal_data']['image']):
                         if isinstance(data, CornserveData):
-                            id = req_id + data.id
-                            await self.sidecar_receiver.mark_done(id)
+                            await self.sidecar_receiver.mark_done(data.id)
 
         # If the request is disconnected by the client, the
         # generate() task will be canceled. So, we abort the
