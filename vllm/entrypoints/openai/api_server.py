@@ -1327,7 +1327,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     if args.cornserve_sidecar_ranks:
-        logger.info("Configuring OpenTelemetry with cornserve sidecar ranks")
+        logger.info("Cornserve: configuring OpenTelemetry with cornserve sidecar ranks")
         configure_otel(f"vLLM{str(args.cornserve_sidecar_ranks).replace(' ', '')}")
 
     async with build_async_engine_client(args) as engine_client:

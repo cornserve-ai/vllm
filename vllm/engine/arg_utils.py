@@ -1210,7 +1210,7 @@ class EngineArgs:
             collect_detailed_traces=self.collect_detailed_traces,
         )
 
-        logger.info("Cornserve config: %s", cornserve_config)
+        logger.info("Cornserve: using config %s", cornserve_config)
 
         config = VllmConfig(
             model_config=model_config,
