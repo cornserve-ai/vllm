@@ -256,7 +256,7 @@ class AsyncLLM(EngineClient):
             coros = []
             for p in mm_placeholders:
                 if p.data_id is not None:
-                    logger.info("CORNSERVE: CUSTOM trying to receive data_id %s", p.data_id)
+                    logger.info("Cornserve: trying to receive data_id %s", p.data_id)
                     coros.append(self.sidecar_receiver.recv(p.data_id))
             if coros:
                 # wait for all coroutines to finish

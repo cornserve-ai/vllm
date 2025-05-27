@@ -31,9 +31,7 @@ def _patch_data_forward(
 ) -> tuple[dict[str, list[str]], Mapping[str, object]]:
     saved_mm_data_ids = {}
     patched_mm_data = {}
-    logger.info("CS mm_data type=%s", type(mm_data))
     for k, v in mm_data.items():
-        logger.info("CS k=%s, v=%s", k, v)
         if k not in DATAFORWARD_MODALITIES:
             patched_mm_data[k] = v
             continue
@@ -43,7 +41,6 @@ def _patch_data_forward(
         data_list = v
 
         # assert isinstance(data_list, list)
-        logger.info("CS data_list=%s", [d for d in data_list])
         if any(isinstance(d, DataForward) for d in data_list):
             if not all(isinstance(d, DataForward) for d in data_list):
                 raise ValueError(

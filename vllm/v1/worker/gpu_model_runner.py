@@ -930,12 +930,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             encoder_outputs.append(output)
                             continue
                     logger.error(
-                        "Cornserve: Received %d token count does not match expected %d",
+                        "Cornserve: received %d token count does not match expected %d",
                         received_num_tokens,
                         num_tokens,
                     )
 
-                logger.warning("Cornserve: Using random encoder inputs")
+                logger.warning("Cornserve: using random encoder inputs")
                 dtype = self.dtype if isinstance(self.dtype, torch.dtype) else getattr(torch, self.dtype)
                 output = torch.randn(num_tokens, self.hidden_size, device=self.device, dtype=dtype)
                 encoder_outputs.append(output)
@@ -944,7 +944,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for (req_id, input_id, pos_info), output in zip(req_ids_pos, encoder_outputs):
             if req_id not in self.encoder_cache:
                 self.encoder_cache[req_id] = {}
-            logger.info("Cornserve: caching encoder output %s is_embed %s", pos_info.data_id, pos_info.is_embed)
             self.encoder_cache[req_id][input_id] = scatter_mm_placeholders(
                 output,
                 is_embed=pos_info.is_embed,

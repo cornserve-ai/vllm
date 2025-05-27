@@ -461,7 +461,7 @@ class Scheduler(SchedulerInterface):
                         and self.cornserve_config.scheduler_policy == "FCFS" \
                             and (mm_placeholder := request.mm_positions):
                         for p in mm_placeholder:
-                            logger.info("CORNSERVE: FCFS trying to receive data_id %s", p.data_id)
+                            logger.info("Cornserve: trying to receive data_id %s", p.data_id)
                             self.sidecar_receiver.recv_sync(p.data_id)
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
