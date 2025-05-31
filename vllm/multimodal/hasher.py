@@ -11,6 +11,7 @@ from PIL import Image
 
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import DataForward
+from vllm.multimodal.image import convert_image_mode
 
 if TYPE_CHECKING:
     from vllm.inputs import TokensPrompt
@@ -36,7 +37,8 @@ class MultiModalHasher:
             return np.array(obj).tobytes()
 
         if isinstance(obj, Image.Image):
-            return cls.item_to_bytes("image", np.array(obj.convert("RGBA")))
+            return cls.item_to_bytes(
+                "image", np.asarray(convert_image_mode(obj, "RGBA")))
         if isinstance(obj, torch.Tensor):
             return cls.item_to_bytes("tensor", obj.numpy())
         if isinstance(obj, np.ndarray):
@@ -44,7 +46,7 @@ class MultiModalHasher:
                 "ndarray", {
                     "dtype": obj.dtype.str,
                     "shape": obj.shape,
-                    "data": obj.data.tobytes(),
+                    "data": obj.tobytes(),
                 })
 
         logger.warning(
