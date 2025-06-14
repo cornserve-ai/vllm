@@ -5,6 +5,7 @@ import asyncio
 import collections
 import concurrent.futures
 import contextlib
+from contextlib import contextmanager
 import copy
 import glob
 import multiprocessing
@@ -12,47 +13,62 @@ import os
 import pickle
 import queue
 import signal
-import time
-from contextlib import contextmanager
 from threading import Thread
-from typing import (Any, AsyncGenerator, Dict, Generator, Iterator, List,
-                    Mapping, Optional, Set, Tuple, Union)
+import time
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    Generator,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
+from huggingface_hub import snapshot_download
 import numpy as np
 import psutil
 import torch
 import zmq
+from zmq import Frame
 import zmq.asyncio
-from zmq import Frame  # type: ignore[attr-defined]
 from zmq.asyncio import Socket
 
-import vllm.envs as envs
 from vllm.config import LoadConfig, ModelConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.async_llm_engine import AsyncEngineArgs, AsyncLLMEngine
-from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
-                                         IPC_HEALTH_EXT, IPC_INPUT_EXT,
-                                         IPC_OUTPUT_EXT, REQUEST_OUTPUTS_T,
-                                         RPC_REQUEST_T, VLLM_RPC_SUCCESS_STR,
-                                         RPCError, RPCStartupRequest,
-                                         RPCStartupResponse)
-from vllm.engine.multiprocessing.client import (MQClientClosedError,
-                                                MQLLMEngineClient)
+from vllm.engine.multiprocessing import (
+    ENGINE_DEAD_ERROR,
+    IPC_DATA_EXT,
+    IPC_HEALTH_EXT,
+    IPC_INPUT_EXT,
+    IPC_OUTPUT_EXT,
+    REQUEST_OUTPUTS_T,
+    RPCError,
+    RPCStartupRequest,
+    RPCStartupResponse,
+    RPC_REQUEST_T,
+    VLLM_RPC_SUCCESS_STR,
+)
+from vllm.engine.multiprocessing.client import MQClientClosedError, MQLLMEngineClient
 from vllm.engine.multiprocessing.engine import run_mp_engine
+import vllm.envs as envs
 from vllm.envs import VLLM_RPC_TIMEOUT
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.model_loader.loader import (
-    safetensors_weights_iterator)
+from vllm.model_executor.model_loader.loader import safetensors_weights_iterator
 from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.config import (get_config,
-                                            try_get_generation_config)
+from vllm.transformers_utils.config import get_config, try_get_generation_config
 from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import LRUCache, get_open_zmq_ipc_path
@@ -261,6 +277,10 @@ class _MQOmniCode2WavEngine:
         log_requests: bool = True,
         code2wav_dynamic_batch: bool = False,
     ) -> None:
+
+        # download/load model using HfApi, for simplicity, will download the entire model
+        model_path = snapshot_download(model_path, resume_download=True)
+
         if isinstance(device, int):
             device = f'cuda:{device}'
         self.device = torch.device(device)
