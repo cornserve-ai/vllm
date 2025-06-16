@@ -38,6 +38,9 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
 
+    step: int = 1
+    talker_sidecar_ranks: Optional[list[list[int]]] = None
+
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
 

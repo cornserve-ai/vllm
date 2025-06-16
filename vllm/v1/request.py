@@ -31,6 +31,7 @@ class Request:
         lora_request: Optional["LoRARequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
         cache_salt: Optional[str] = None,
+        talker_sidecar_ranks: Optional[list[list[int]]] = None,
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
@@ -66,6 +67,7 @@ class Request:
         kv_params = (None if sampling_params.extra_args is None else
                      sampling_params.extra_args.get("kv_transfer_params"))
         self.kv_transfer_params: Optional[dict[str, Any]] = kv_params
+        self.talker_sidecar_ranks: Optional[list[list[int]]] = talker_sidecar_ranks
         self.span: Span | None = None
 
         # Sanity check
@@ -103,6 +105,7 @@ class Request:
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params),
             cache_salt=request.cache_salt,
+            talker_sidecar_ranks=request.talker_sidecar_ranks,
         )
 
     def append_output_token_ids(

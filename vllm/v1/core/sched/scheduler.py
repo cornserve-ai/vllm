@@ -60,7 +60,7 @@ class Scheduler(SchedulerInterface):
 
         self.cornserve_config = vllm_config.cornserve_config
         if self.cornserve_config:
-            self.sidecar_receiver = Sidecar(
+            self.sidecar_client = Sidecar(
                 SidecarConfig(
                     sidecar_rank=self.cornserve_config.sidecar_ranks[0],
                     group=self.cornserve_config.sidecar_ranks,
@@ -68,6 +68,8 @@ class Scheduler(SchedulerInterface):
                     recv_tensor_dtype=self.vllm_config.model_config.dtype,
                 )
             )
+        architectures = self.vllm_config.model_config.architectures
+        self.is_omni_thinker = "Qwen2_5OmniModel" in architectures and len(architectures) == 1
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -468,7 +470,7 @@ class Scheduler(SchedulerInterface):
                             and (mm_placeholder := request.mm_positions):
                         for p in mm_placeholder:
                             logger.info("Cornserve: trying to receive data_id %s", p.data_id)
-                            self.sidecar_receiver.recv_sync(p.data_id)
+                            self.sidecar_client.recv_sync(p.data_id)
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
@@ -742,9 +744,9 @@ class Scheduler(SchedulerInterface):
                     assert pos.data_id is not None
                     if req.span:
                         with trace.use_span(req.span, end_on_exit=False):
-                            self.sidecar_receiver.mark_done_sync(pos.data_id)
+                            self.sidecar_client.mark_done_sync(pos.data_id)
                     else:
-                        self.sidecar_receiver.mark_done_sync(pos.data_id)
+                        self.sidecar_client.mark_done_sync(pos.data_id)
 
         # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
         # loop can be a performance bottleneck. We should do our best to avoid
@@ -809,6 +811,17 @@ class Scheduler(SchedulerInterface):
                     if request.span:
                         request.span.add_event("scheduler.stop")
                         request.span.end()
+                    if self.is_omni_thinker and self.cornserve_config and request.talker_sidecar_ranks:
+                        data_id = request.request_id.split("-")[-1]
+                        logger.info(
+                            "Closing stream for %s to %s",
+                            data_id,
+                            request.talker_sidecar_ranks,
+                        )
+                        self.sidecar_client.close_stream(
+                            data_id,
+                            request.talker_sidecar_ranks,
+                        )
                     kv_transfer_params = self._free_request(request)
                     del new_token_ids[num_new:]  # Trim new tokens if needed.
                     break
@@ -984,7 +997,7 @@ class Scheduler(SchedulerInterface):
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.cornserve_config:
-            self.sidecar_receiver.shutdown_sync()
+            self.sidecar_client.shutdown_sync()
 
     ########################################################################
     # P/D Related Methods

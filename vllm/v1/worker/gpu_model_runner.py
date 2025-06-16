@@ -93,6 +93,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.observability_config = vllm_config.observability_config
         self.cornserve_config = vllm_config.cornserve_config
 
+        architectures = self.model_config.architectures
+        self.is_omni_thinker = "Qwen2_5OmniModel" in architectures and len(architectures) == 1
+
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
             int(self.cache_config.cpu_offload_gb * 1024**3))
@@ -137,7 +140,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Cornserve
         if self.cornserve_config:
-            self.sidecar_reader = Sidecar(
+            self.sidecar_client = Sidecar(
                 SidecarConfig(
                     sidecar_rank= self.cornserve_config.sidecar_ranks[0],
                     group = self.cornserve_config.sidecar_ranks,
@@ -392,6 +395,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                talker_sidecar_ranks=new_req_data.talker_sidecar_ranks,
             )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -437,6 +441,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for req_data in scheduler_output.scheduled_cached_reqs:
             req_id = req_data.req_id
             req_state = self.requests[req_id]
+            req_state.step += 1
 
             # Update the cached states.
             num_computed_tokens = req_data.num_computed_tokens
@@ -929,12 +934,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for input_id in encoder_input_ids:
                 req_ids_pos.append((req_id, input_id, req_state.mm_positions[input_id]))
                 pos_info = req_state.mm_positions[input_id]
+                logger.info("Cornserve debug mm_positions: %s", pos_info)
                 num_tokens = pos_info.length if pos_info.is_embed is None else int(sum(pos_info.is_embed))
                 if pos_info.data_id:
                     logger.info("Cornserve: trying to read %s", pos_info.data_id)
                     received_num_tokens = 0
-                    if self.sidecar_reader:
-                        output = self.sidecar_reader.recv_sync(pos_info.data_id).to(self.device)
+                    if self.sidecar_client:
+                        output = self.sidecar_client.recv_sync(pos_info.data_id).to(self.device)
                         received_num_tokens = output.size(0)
                         logger.info(
                             "Cornserve: expecting %d tokens received %d",
@@ -970,7 +976,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return
 
         logger.info("Cornserve: verifying encoder outputs")
-        if not self.sidecar_reader:
+        if not self.sidecar_client:
             raise RuntimeError("Sidecar is not conncected for Cornserve")
         self._execute_mm_encoder(scheduler_output)
 
@@ -984,7 +990,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if pos_info.data_id:
                     logger.info("Cornserve: trying to read %s", pos_info.data_id)
                     received_num_tokens = 0
-                    output = self.sidecar_reader.recv_sync(pos_info.data_id).to(self.device)
+                    output = self.sidecar_client.recv_sync(pos_info.data_id).to(self.device)
                     received_num_tokens = output.size(0)
                     logger.info("Cornserve: expecting %d received %d", num_tokens, received_num_tokens)
                     if output.size(0) == num_tokens:
@@ -1316,6 +1322,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
             )
 
+            logger.info("Model output: %s", model_output)
+
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
@@ -1547,6 +1555,52 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
+
+        # TODO: add another arg for omni thinker to toggle forwarding
+        # request-level config
+        if self.is_omni_thinker and self.cornserve_config:
+            assert isinstance(hidden_states, torch.Tensor)
+
+            offset = 0
+            for req_id in self.input_batch.req_ids:
+                n_tok = scheduler_output.num_scheduled_tokens[req_id]   # tokens for THIS step
+                if n_tok == 0:
+                    continue                                            # idle request
+                hs_slice = hidden_states[offset : offset + n_tok]       # [n_tok, 3584]
+                offset += n_tok
+                req_state = self.requests[req_id]
+                if not req_state.talker_sidecar_ranks:
+                    continue  # no talker sidecar ranks, don't forwarding embeds
+
+                num_output_tokens = len(req_state.output_token_ids)
+                talker_sidecar_ranks = req_state.talker_sidecar_ranks
+                data_id = req_id.split("-")[-1]
+                # send over sliced hidden_states with chunk_id num_output_tokens
+                if num_output_tokens == 1:
+                    # forward the first token id
+                    obj = {
+                        "first_token_id": req_state.output_token_ids[0],
+                        "num_prefill_tokens": len(req_state.prompt_token_ids),
+                        "prompt_token_ids": req_state.prompt_token_ids,
+                    }
+                    logger.debug("Cornserve: forwarding req_id %s, chunk_id %s, obj %s - %s to %s",
+                            data_id, 0, len(req_state.prompt_token_ids),obj, talker_sidecar_ranks)
+                    self.sidecar_client.send(
+                        data=obj,
+                        id=data_id,
+                        dst_sidecar_ranks=talker_sidecar_ranks,
+                        chunk_id=0,
+                        stream=True
+                    )
+
+                chunk_id = req_state.step
+                self.sidecar_client.send(
+                    data=hs_slice,
+                    id=data_id,
+                    dst_sidecar_ranks=talker_sidecar_ranks,
+                    chunk_id=chunk_id,
+                    stream=True
+                )
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,

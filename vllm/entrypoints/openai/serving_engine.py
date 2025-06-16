@@ -856,6 +856,9 @@ class OpenAIServing:
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
+        if hasattr(request, "talker_sidecar_ranks"):
+            engine_prompt["talker_sidecar_ranks"] = request.talker_sidecar_ranks
+
         return conversation, [request_prompt], [engine_prompt]
 
     def _load_prompt_embeds(

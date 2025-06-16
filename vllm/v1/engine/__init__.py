@@ -59,6 +59,7 @@ class EngineCoreRequest(
     lora_request: Optional[LoRARequest]
     cache_salt: Optional[str]
     otel_carrier: Optional[dict] = None
+    talker_sidecar_ranks: Optional[list[list[int]]] = None
 
     # Used in DP case to indicate which wave of requests this is expected to
     # belong to, to cover a race condition where the request is sent before

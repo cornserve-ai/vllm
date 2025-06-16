@@ -273,6 +273,11 @@ class AsyncLLM(EngineClient):
         propagator.inject(carrier)
         request.otel_carrier = carrier
 
+        talker_sidecar_ranks = prompt.get("talker_sidecar_ranks", None)  # type: ignore
+        if talker_sidecar_ranks:
+            logger.info("Cornserve: talker_sidecar_ranks %s", talker_sidecar_ranks)
+            request.talker_sidecar_ranks = talker_sidecar_ranks
+
         if params.n == 1:
             await self._add_request(request, prompt_str, None, 0, queue)
             return queue
