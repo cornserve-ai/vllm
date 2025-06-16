@@ -217,6 +217,8 @@ class EngineArgs:
     # anable hidden state caching for the model
     enable_hidden_state_caching: bool = False
 
+    cornserve_sidecar_ranks: Optional[list[int]] = None
+
     def __post_init__(self):
         if not self.tokenizer:
             self.tokenizer = self.model
