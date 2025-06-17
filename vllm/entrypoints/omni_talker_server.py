@@ -113,7 +113,7 @@ async def generate(request: ChatCompletionRequest, raw_request: Request) -> Resp
     )
 
 def init_omni_engine(args: Namespace) -> OmniTalkerVocoderEngine:
-    model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = args.model_id
     # only used for loading thinker embeddings
     thinker_engine_args = AsyncEngineArgs(model=model_name, trust_remote_code=True)
     talker_engine_args = AsyncEngineArgs(
@@ -216,6 +216,12 @@ async def run_server(args: Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # TODO: make this config
+    parser.add_argument(
+        "model_id",
+        type=str,
+        choices=["Qwen/Qwen2.5-Omni-7B"],
+        help="Name of the model to use",
+    )
     parser.add_argument("--host", type=str, default=None)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument('--enforce-eager', action='store_true')
