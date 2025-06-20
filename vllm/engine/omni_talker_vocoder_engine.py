@@ -6,7 +6,7 @@ import concurrent.futures
 import contextlib
 from contextlib import contextmanager
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import glob
 import multiprocessing
 import os
@@ -83,12 +83,15 @@ envs.VLLM_USE_V1 = 0
 
 @dataclass
 class ForwardRequestOutput:
+    """Forwarded outputs from the Thinker."""
     request_id: str
     finished: bool
     num_output_tokens: int
     first_token_id: int
     prompt_token_ids: list[int]
     prompt_embeds: torch.Tensor
+
+    chunk_ids: list[int] = field(default_factory=list)
 
     def __repr__(self):
         return (f"ForwardRequestOutput(request_id={self.request_id}, prompt_token_ids={len(self.prompt_token_ids)}, "
@@ -2071,6 +2074,9 @@ class OmniTalkerVocoderEngine:
 
         # WARNING, this used to go to the thinker device
         output_prompt_embeds = output.prompt_embeds.to(self.device)
+        if self.cornserve_sidecar_ranks:
+            for chunk_id in output.chunk_ids:
+                self.sidecar_client.mark_done_sync(id=request_id, chunk_id=chunk_id)
 
         if output.num_output_tokens == 1:
             self.thinker_prompt_embeds[
@@ -2204,22 +2210,27 @@ class OmniTalkerVocoderEngine:
             
         async def sidecar_req_generator(request_id: str) -> AsyncGenerator[ForwardRequestOutput, None]:
 
-            def do_recv(req_id: str, chunk_id: int):
-                logger.info("^^^ Trying to receive chunk %d for request_id: %s", chunk_id, req_id)
-                return self.sidecar_client.recv_sync(id=req_id, chunk_id=chunk_id)
+            def do_recv(req_id: str, chunk_id: int) -> Any:
+                chunk = self.sidecar_client.recv_sync(id=req_id, chunk_id=chunk_id)
+                logger.info("Received chunk %d for request_id: %s is None %s", chunk_id, req_id, chunk is None)
+                return chunk
 
             logger.info("Sidecar request generator for request_id: %s", request_id)
             chunk_id = 0
             token_data = do_recv(request_id, chunk_id)
-            if "first_token_id" not in token_data or "num_prefill_tokens" not in token_data:
+            if token_data is None or "first_token_id" not in token_data or "num_prefill_tokens" not in token_data:
                 raise ValueError(f"Invalid token data received from sidecar: {token_data}")
+            # logger.info("Request id %s expecting num_prefill_tokens: %d", request_id, token_data["num_prefill_tokens"])
 
             # first get the prefill_chunks
             prefill_chunks = []
             num_received = 0
             while True:
                 chunk_id += 1
-                pchunk: torch.Tensor = do_recv(request_id, chunk_id)
+                pchunk: torch.Tensor | None = do_recv(request_id, chunk_id)
+                if pchunk is None:
+                    raise ValueError(f"Received None chunk for request_id: {request_id}, chunk_id: {chunk_id} during prefill")
+                # logger.info("Received prefill chunk %d shape %s for request_id: %s", chunk_id, pchunk.shape, request_id)
                 n = pchunk.shape[0]
                 num_received += n
                 prefill_chunks.append(pchunk)
@@ -2240,6 +2251,7 @@ class OmniTalkerVocoderEngine:
                 num_output_tokens=chunk_id - base_chunk_id,
                 finished=False,
                 prompt_token_ids=token_data["prompt_token_ids"],
+                chunk_ids=list(range(0, chunk_id +1))
             )
 
             chunk_id += 1
@@ -2255,6 +2267,7 @@ class OmniTalkerVocoderEngine:
                         num_output_tokens=chunk_id - base_chunk_id - 1,
                         finished=True,
                         prompt_token_ids=token_data["prompt_token_ids"],
+                        chunk_ids=[chunk_id -1]
                     )
                     break
                 else:
@@ -2265,6 +2278,7 @@ class OmniTalkerVocoderEngine:
                         num_output_tokens= chunk_id - base_chunk_id - 1,
                         finished=False,
                         prompt_token_ids=token_data["prompt_token_ids"],
+                        chunk_ids=[chunk_id -1]
                     )
                 prev_chunk = chunk
 
