@@ -34,6 +34,15 @@ from vllm.multimodal.processing_omni import fetch_image, fetch_video
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm.entrypoints.omni_utils import make_inputs_qwen2_omni
+
+# set uuid seed
+import random
+import time
+random.seed(time.time())
+uuid.uuid4 = lambda: uuid.UUID(int=random.getrandbits(128))
+
+
 logger = init_logger('vllm.omni')
 
 parser = argparse.ArgumentParser()
@@ -184,152 +193,152 @@ def fetch_and_read_video(video_url: str, fps=2):
         return read_video(video_file_name)
 
 
-def make_inputs_qwen2_omni(
-    messages: List[Dict[str, Union[str, List[Dict[str, str]]]]],
-    use_audio_in_video: Optional[bool] = False,
-    tokenize: bool = args.tokenize,
-) -> Union[TokensPrompt, TextPrompt]:
-    processor = AutoProcessor.from_pretrained(args.thinker_model)
-    tokenizer = AutoTokenizer.from_pretrained(args.thinker_model)
-
-    try:
-        config = AutoConfig.from_pretrained(args.thinker_model)
-        if 'Qwen2_5OmniModel' in config.architectures:
-            args.legacy_omni_video = False
-        else:
-            args.legacy_omni_video = True
-    except:
-        args.legacy_omni_video = True
-
-    audios, images, videos = [], [], []
-    for message in messages:
-        if not isinstance(message['content'], list):
-            message['content'] = [{
-                'type': 'text',
-                'text': message['content'],
-            }]
-        index, num_contents = 0, len(message['content'])
-        while index < num_contents:
-            ele = message['content'][index]
-            if 'type' not in ele:
-                if 'text' in ele:
-                    ele['type'] = 'text'
-                elif 'audio' in ele:
-                    ele['type'] = 'audio'
-                elif 'audio_url' in ele:
-                    ele['type'] = 'audio_url'
-                elif 'image' in ele:
-                    ele['type'] = 'image'
-                elif 'image_url' in ele:
-                    ele['type'] = 'image_url'
-                elif 'video' in ele:
-                    ele['type'] = 'video'
-                elif 'video_url' in ele:
-                    ele['type'] = 'video_url'
-                else:
-                    raise ValueError(f'Unknown ele: {ele}')
-
-            if ele['type'] == 'audio' or ele['type'] == 'audio_url':
-                if 'audio_url' in ele:
-                    audio_key = 'audio_url'
-                    with tempfile.NamedTemporaryFile(
-                            delete=True) as temp_audio_file:
-                        temp_audio_file.write(urlopen(ele[audio_key]).read())
-                        temp_audio_file_path = temp_audio_file.name
-                        audios.append(
-                            resample_wav_to_16khz(temp_audio_file_path))
-                        ele['audio'] = temp_audio_file_path
-                elif 'audio' in ele:
-                    audio_key = 'audio'
-                    audios.append(resample_wav_to_16khz(ele[audio_key]))
-                else:
-                    raise ValueError(f'Unknown ele {ele}')
-            elif use_audio_in_video and (ele['type'] == 'video'
-                                         or ele['type'] == 'video_url'):
-                # use video as audio as well
-                if 'video_url' in ele:
-                    audio_key = 'video_url'
-                    with tempfile.NamedTemporaryFile(
-                            delete=True) as temp_video_file:
-                        temp_video_file.write(urlopen(ele[audio_key]).read())
-                        temp_video_file_path = temp_video_file.name
-                        ele[audio_key] = temp_video_file_path
-                        audios.append(
-                            librosa.load(temp_video_file_path, sr=16000)[0])
-                        videos.append(
-                            fetch_and_read_video(temp_video_file_path))
-                        ele['video'] = temp_video_file_path
-                elif 'video' in ele:
-                    audio_key = 'video'
-                    audios.append(librosa.load(ele[audio_key], sr=16000)[0])
-                    videos.append(fetch_and_read_video(ele[audio_key]))
-                else:
-                    raise ValueError("Unknown ele {}".format(ele))
-                # insert a audio after the video
-                message['content'].insert(index + 1, {
-                    "type": "audio",
-                    "audio": ele[audio_key],
-                })
-                # no need to load the added audio again
-                index += 1
-            elif ele['type'] == 'video' or ele['type'] == 'video_url':
-                if 'video_url' in ele:
-                    video_key = 'video_url'
-                    with tempfile.NamedTemporaryFile(
-                            delete=True) as temp_video_file:
-                        temp_video_file.write(urlopen(ele['video_url']).read())
-                        temp_video_file_path = temp_video_file.name
-                        videos.append(fetch_and_read_video(temp_video_file))
-                        ele['video'] = temp_video_file_path
-                else:
-                    video_key = 'video'
-                    videos.append(fetch_and_read_video(ele[video_key]))
-            elif ele['type'] == 'image' or ele['type'] == 'image_url':
-                images.append(fetch_image(ele))
-
-            # move to the next content
-            index += 1
-
-    prompt = processor.apply_chat_template(
-        messages,
-        tokenize=tokenize,
-        add_generation_prompt=True,
-        add_vision_id=True,
-    )
-
-    audios = audios if len(audios) > 0 else None
-    images = images if len(images) > 0 else None
-    videos = videos if len(videos) > 0 else None
-
-    logger.info(f'{prompt}, '
-                f'audios = {len(audios) if audios else None}, '
-                f'images = {len(images) if images else None}, '
-                f'videos = {len(videos) if videos else None}')
-
-    multi_modal_data = {}
-    if audios:
-        multi_modal_data["audio"] = audios
-    if images:
-        multi_modal_data["image"] = images
-    if videos:
-        multi_modal_data["video"] = videos
-
-    # pass through the use_audio_in_video to llm engine
-    multi_modal_data["use_audio_in_video"] = use_audio_in_video
-
-    if isinstance(prompt, list) and isinstance(prompt[0], (list, str)):
-        prompt = prompt[0]
-
-    if tokenize:
-        return TokensPrompt(
-            prompt_token_ids=prompt,
-            multi_modal_data=multi_modal_data,
-        )
-    else:
-        return TextPrompt(
-            prompt=prompt,
-            multi_modal_data=multi_modal_data,
-        )
+# def make_inputs_qwen2_omni(
+#     messages: List[Dict[str, Union[str, List[Dict[str, str]]]]],
+#     use_audio_in_video: Optional[bool] = False,
+#     tokenize: bool = args.tokenize,
+# ) -> Union[TokensPrompt, TextPrompt]:
+#     processor = AutoProcessor.from_pretrained(args.thinker_model)
+#     tokenizer = AutoTokenizer.from_pretrained(args.thinker_model)
+#
+#     try:
+#         config = AutoConfig.from_pretrained(args.thinker_model)
+#         if 'Qwen2_5OmniModel' in config.architectures:
+#             args.legacy_omni_video = False
+#         else:
+#             args.legacy_omni_video = True
+#     except:
+#         args.legacy_omni_video = True
+#
+#     audios, images, videos = [], [], []
+#     for message in messages:
+#         if not isinstance(message['content'], list):
+#             message['content'] = [{
+#                 'type': 'text',
+#                 'text': message['content'],
+#             }]
+#         index, num_contents = 0, len(message['content'])
+#         while index < num_contents:
+#             ele = message['content'][index]
+#             if 'type' not in ele:
+#                 if 'text' in ele:
+#                     ele['type'] = 'text'
+#                 elif 'audio' in ele:
+#                     ele['type'] = 'audio'
+#                 elif 'audio_url' in ele:
+#                     ele['type'] = 'audio_url'
+#                 elif 'image' in ele:
+#                     ele['type'] = 'image'
+#                 elif 'image_url' in ele:
+#                     ele['type'] = 'image_url'
+#                 elif 'video' in ele:
+#                     ele['type'] = 'video'
+#                 elif 'video_url' in ele:
+#                     ele['type'] = 'video_url'
+#                 else:
+#                     raise ValueError(f'Unknown ele: {ele}')
+#
+#             if ele['type'] == 'audio' or ele['type'] == 'audio_url':
+#                 if 'audio_url' in ele:
+#                     audio_key = 'audio_url'
+#                     with tempfile.NamedTemporaryFile(
+#                             delete=True) as temp_audio_file:
+#                         temp_audio_file.write(urlopen(ele[audio_key]).read())
+#                         temp_audio_file_path = temp_audio_file.name
+#                         audios.append(
+#                             resample_wav_to_16khz(temp_audio_file_path))
+#                         ele['audio'] = temp_audio_file_path
+#                 elif 'audio' in ele:
+#                     audio_key = 'audio'
+#                     audios.append(resample_wav_to_16khz(ele[audio_key]))
+#                 else:
+#                     raise ValueError(f'Unknown ele {ele}')
+#             elif use_audio_in_video and (ele['type'] == 'video'
+#                                          or ele['type'] == 'video_url'):
+#                 # use video as audio as well
+#                 if 'video_url' in ele:
+#                     audio_key = 'video_url'
+#                     with tempfile.NamedTemporaryFile(
+#                             delete=True) as temp_video_file:
+#                         temp_video_file.write(urlopen(ele[audio_key]).read())
+#                         temp_video_file_path = temp_video_file.name
+#                         ele[audio_key] = temp_video_file_path
+#                         audios.append(
+#                             librosa.load(temp_video_file_path, sr=16000)[0])
+#                         videos.append(
+#                             fetch_and_read_video(temp_video_file_path))
+#                         ele['video'] = temp_video_file_path
+#                 elif 'video' in ele:
+#                     audio_key = 'video'
+#                     audios.append(librosa.load(ele[audio_key], sr=16000)[0])
+#                     videos.append(fetch_and_read_video(ele[audio_key]))
+#                 else:
+#                     raise ValueError("Unknown ele {}".format(ele))
+#                 # insert a audio after the video
+#                 message['content'].insert(index + 1, {
+#                     "type": "audio",
+#                     "audio": ele[audio_key],
+#                 })
+#                 # no need to load the added audio again
+#                 index += 1
+#             elif ele['type'] == 'video' or ele['type'] == 'video_url':
+#                 if 'video_url' in ele:
+#                     video_key = 'video_url'
+#                     with tempfile.NamedTemporaryFile(
+#                             delete=True) as temp_video_file:
+#                         temp_video_file.write(urlopen(ele['video_url']).read())
+#                         temp_video_file_path = temp_video_file.name
+#                         videos.append(fetch_and_read_video(temp_video_file))
+#                         ele['video'] = temp_video_file_path
+#                 else:
+#                     video_key = 'video'
+#                     videos.append(fetch_and_read_video(ele[video_key]))
+#             elif ele['type'] == 'image' or ele['type'] == 'image_url':
+#                 images.append(fetch_image(ele))
+#
+#             # move to the next content
+#             index += 1
+#
+#     prompt = processor.apply_chat_template(
+#         messages,
+#         tokenize=tokenize,
+#         add_generation_prompt=True,
+#         add_vision_id=True,
+#     )
+#
+#     audios = audios if len(audios) > 0 else None
+#     images = images if len(images) > 0 else None
+#     videos = videos if len(videos) > 0 else None
+#
+#     logger.info(f'{prompt}, '
+#                 f'audios = {len(audios) if audios else None}, '
+#                 f'images = {len(images) if images else None}, '
+#                 f'videos = {len(videos) if videos else None}')
+#
+#     multi_modal_data = {}
+#     if audios:
+#         multi_modal_data["audio"] = audios
+#     if images:
+#         multi_modal_data["image"] = images
+#     if videos:
+#         multi_modal_data["video"] = videos
+#
+#     # pass through the use_audio_in_video to llm engine
+#     multi_modal_data["use_audio_in_video"] = use_audio_in_video
+#
+#     if isinstance(prompt, list) and isinstance(prompt[0], (list, str)):
+#         prompt = prompt[0]
+#
+#     if tokenize:
+#         return TokensPrompt(
+#             prompt_token_ids=prompt,
+#             multi_modal_data=multi_modal_data,
+#         )
+#     else:
+#         return TextPrompt(
+#             prompt=prompt,
+#             multi_modal_data=multi_modal_data,
+#         )
 
 
 def get_system_prompt():
@@ -353,23 +362,114 @@ def get_system_prompt():
             }]
         }
 
-
-def make_text_prompt():
+def make_prompt_video_small():
+    logger.info("make_prompt_video_small")
     messages = [
-        get_system_prompt(),
         {
-            "role": "user",
+            'role':
+            'system',
+            'content': [{
+                'type':
+                'text',
+                'text':
+                'You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.'
+            }]
+        },
+        {
+            "role":
+            "user",
             "content": [
                 {
-                    "type": "text",
-                    "text": "Who are you?"
+                    "type": "video_url",
+                    "video_url": "https://dedicated.junzema.com/draw_small.mp4"
                 },
             ]
         },
     ]
-
-    prompt = make_inputs_qwen2_omni(messages, )
+    prompt = make_inputs_qwen2_omni(messages,)  # type: ignore
     return prompt
+
+
+def make_prompt_video_full():
+    logger.info("make_prompt_video_full")
+    messages = [
+        {
+            'role':
+            'system',
+            'content': [{
+                'type':
+                'text',
+                'text':
+                'You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.'
+            }]
+        },
+        {
+            "role":
+            "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": "https://dedicated.junzema.com/draw.mp4"
+                },
+            ]
+        },
+    ]
+    prompt = make_inputs_qwen2_omni(messages,)  # type: ignore
+    return prompt
+
+def make_prompt_audio_small():
+    logger.info("make_prompt_audio_small")
+    messages = [
+        {
+            'role':
+            'system',
+            'content': [{
+                'type':
+                'text',
+                'text':
+                'You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.'
+            }]
+        },
+        {
+            "role":
+            "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": "https://dedicated.junzema.com/draw_small.wav"
+                },
+            ]
+        },
+    ]
+    prompt = make_inputs_qwen2_omni(messages,)  # type: ignore
+    return prompt
+
+def make_prompt_audio_full():
+    logger.info("make_prompt_audio_full")
+    messages = [
+        {
+            'role':
+            'system',
+            'content': [{
+                'type':
+                'text',
+                'text':
+                'You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.'
+            }]
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": "https://dedicated.junzema.com/draw.wav"
+                },
+            ]
+        },
+    ]
+    prompt = make_inputs_qwen2_omni(messages,)  # type: ignore
+    return prompt
+
 
 
 def make_audio_in_video_v2_prompt():
@@ -414,8 +514,8 @@ def init_omni_engine():
         distributed_executor_backend="mp",
         limit_mm_per_prompt={
             'audio': 32,
-            'image': 960,
-            'video': 32
+            'image': 16,
+            'video': 4
         },
         max_model_len=32768,
         max_num_seqs=args.max_num_seqs,
@@ -473,14 +573,9 @@ def init_omni_engine():
         )
 
 
-def make_omni_prompt() -> Union[TokensPrompt, List[TokensPrompt]]:
-    if args.prompt == 'text':
-        prompt = make_text_prompt()
-    elif args.prompt == 'audio-in-video-v2':
-        prompt = make_audio_in_video_v2_prompt()
-    else:
-        raise ValueError(f'Unsupported prompt type: {args.prompt}')
-    return prompt
+def make_omni_prompt() -> Union[TokensPrompt, List[TextPrompt]]:
+    # return make_prompt_video_full()
+    return make_prompt_audio_full()
 
 
 def now():
@@ -658,7 +753,7 @@ def main():
         args.voice_type, args.warmup_voice_type))
 
     # warmup
-    run_omni_engine(prompt, omni, num_prompts=args.num_prompts, is_warmup=True)
+    # run_omni_engine(prompt, omni, num_prompts=args.num_prompts, is_warmup=True)
 
     try:
         run_omni_engine(prompt, omni, args.num_prompts, is_warmup=False)

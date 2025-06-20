@@ -19,11 +19,27 @@ thread_local = threading.local()
 class OmniProcessor:
     """Async thread pool processor for Omni model."""
     def __init__(self, model_name: str = "Qwen/Qwen2.5-Omni-7B", max_workers: int = 4) -> None:
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        feature_extractor = getattr(self.processor, "feature_extractor", None)
+        if feature_extractor is None:
+            raise ValueError(
+                "In order to determine the audio sampling rate, we attempted to "
+                "access the HF AutoProcessor's `feature_extractor`, but it didn't exist."
+            )
+        sampling_rate = getattr(feature_extractor, "sampling_rate", None)
+        if sampling_rate is None:
+            raise ValueError(
+                "In order to determine the audio sampling rate, we attempted to "
+                "access the HF AutoProcessor's `feature_extractor.sampling_rate`, "
+                "but it didn't exist."
+            )
+        self.modality_config = ModalityConfig()
+        self.modality_config.audio_config.sampling_rate = sampling_rate
 
         def init_thread() -> None:
             """Initialize thread-local processor and loader."""
-            thread_local.processor = AutoProcessor.from_pretrained(model_name)
-            thread_local.loader = ModalityDataLoader(ModalityConfig())
+            thread_local.processor = self.processor
+            thread_local.loader = ModalityDataLoader(self.modality_config)
 
         self.loop = asyncio.get_event_loop()
         self.pool = ThreadPoolExecutor(max_workers=max_workers, initializer=init_thread)
@@ -118,11 +134,26 @@ def make_inputs_qwen2_omni(
 ) -> TextPrompt:
     processor = AutoProcessor.from_pretrained(model_name)
 
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    if feature_extractor is None:
+        raise ValueError(
+            "In order to determine the audio sampling rate, we attempted to "
+            "access the HF AutoProcessor's `feature_extractor`, but it didn't exist."
+        )
+    sampling_rate = getattr(feature_extractor, "sampling_rate", None)
+    if sampling_rate is None:
+        raise ValueError(
+            "In order to determine the audio sampling rate, we attempted to "
+            "access the HF AutoProcessor's `feature_extractor.sampling_rate`, "
+            "but it didn't exist."
+        )
+    modality_config = ModalityConfig()
+    modality_config.audio_config.sampling_rate = sampling_rate
+    loader = ModalityDataLoader(modality_config)
+
     messages, image_urls, video_urls, audio_urls = convert_messages(chat_messages)
     prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-
-    loader = ModalityDataLoader(ModalityConfig())
+    logger.info("Using config %s for audio loader", loader.audio_loader.config)
     video_data = [loader.load_from_url(Modality.VIDEO, u) for u in video_urls]
     image_data = [loader.load_from_url(Modality.IMAGE, u) for u in image_urls]
     audio_data = [loader.load_from_url(Modality.AUDIO, u) for u in audio_urls]
