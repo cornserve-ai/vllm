@@ -1584,7 +1584,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         "prompt_token_ids": req_state.prompt_token_ids,
                     }
                     logger.debug("Cornserve: forwarding req_id %s, chunk_id %s, obj %s - %s to %s",
-                            data_id, 0, len(req_state.prompt_token_ids),obj, talker_sidecar_ranks)
+                            data_id, 0, len(req_state.prompt_token_ids), obj, talker_sidecar_ranks)
                     self.sidecar_client.send(
                         data=obj,
                         id=data_id,
