@@ -73,7 +73,7 @@ from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import LRUCache, get_open_zmq_ipc_path
 
-from vllm.engine.omni_talker_vocoder_engine import ForwardRequestOutput
+# from vllm.engine.omni_talker_vocoder_engine import ForwardRequestOutput
 
 POLLING_TIMEOUT_MS = 10000
 HEALTHY_RESPONSE = (pickle.dumps(VLLM_RPC_SUCCESS_STR), )
@@ -1820,16 +1820,16 @@ class OmniLLMEngine:
         def _listen():
             last_output = None
             for output in SynchronizedGenerator(generator, self._loop):
-                forward_output = ForwardRequestOutput(
-                    request_id=output.request_id,
-                    num_output_tokens = len(output.outputs[0].token_ids),
-                    finished=output.finished,
-                    first_token_id=output.outputs[0].token_ids[0],
-                    prompt_embeds=output.outputs[0].prompt_embeds,  # type: ignore
-                    prompt_token_ids=output.prompt_token_ids,  # type: ignore
-                )
-                logger.info("constructed ForwardRequestOutput: %s", forward_output)
-                forward_output.save()
+                # forward_output = ForwardRequestOutput(
+                #     request_id=output.request_id,
+                #     num_output_tokens = len(output.outputs[0].token_ids),
+                #     finished=output.finished,
+                #     first_token_id=output.outputs[0].token_ids[0],
+                #     prompt_embeds=output.outputs[0].prompt_embeds,  # type: ignore
+                #     prompt_token_ids=output.prompt_token_ids,  # type: ignore
+                # )
+                # logger.info("constructed ForwardRequestOutput: %s", forward_output)
+                # forward_output.save()
                 if include_voice and self.talker_engine_args:
                     if output.finished:
                         thinker_output = copy.deepcopy(output)
