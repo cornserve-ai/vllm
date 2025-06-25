@@ -134,16 +134,29 @@ class MediaConnector:
         if url_spec.scheme == "data":
             for modality in DATAFORWARD_MODALITIES:
                 if url_spec.path.startswith(f"{modality}/uuid;"):
-                    # url = f"data:image/uuid;data_id={uuid.uuid4().hex};url={url},"
+                    # url = f"data:image/uuid;data_id={uuid.uuid4().hex};url={original_url},"
                     full_str = url_spec.path.replace(f"{modality}/uuid;", "")
-                    uuid = full_str.split(";")[0].replace("data_id=", "")
-                    url = full_str.split(";")[1].replace("url=", "")
-                    if url.endswith(","):
-                        url = url[:-1]
-                    # assumes HTTP(s)
-                    data = await self.connection.async_get_bytes(
-                        url, timeout=fetch_timeout)
-                    return DataForward(id=uuid, data=media_io.load_bytes(data))
+                    data_id_part, data_url = full_str.split(';url=', 1)
+                    data_id  = data_id_part.removeprefix('data_id=')
+                    if data_url.endswith(','):
+                        data_url = data_url[:-1]
+                    data_url_spec = urlparse(data_url)
+                    if data_url_spec.scheme.startswith("http"):
+                        data = await self.connection.async_get_bytes(
+                            data_url, timeout=fetch_timeout)
+                        return DataForward(id=data_id, data=media_io.load_bytes(data))
+                    elif data_url_spec.scheme == "file":
+                        data = self._load_file_url(data_url_spec, media_io)
+                        return DataForward(id=data_id, data=self._load_file_url(
+                            data_url_spec, media_io))
+                    elif data_url_spec.scheme == "data":
+                        data = self._load_data_url(data_url_spec, media_io)
+                        return DataForward(id=data_id, data=self._load_data_url(
+                            data_url_spec, media_io))
+                    else:
+                        raise ValueError(
+                            "The URL must be either a HTTP, data or file URL.")
+
             return self._load_data_url(url_spec, media_io)
 
         if url_spec.scheme == "file":
