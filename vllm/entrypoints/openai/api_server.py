@@ -1332,7 +1332,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     async with build_async_engine_client(args) as engine_client:
         app = build_app(args)
-        FastAPIInstrumentor().instrument_app(app)
+        FastAPIInstrumentor().instrument_app(app, exclude_spans=["send", "receive"])
 
         vllm_config = await engine_client.get_vllm_config()
         await init_app_state(engine_client, vllm_config, app.state, args)
