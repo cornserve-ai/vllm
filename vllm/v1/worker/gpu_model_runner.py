@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -148,6 +149,9 @@ from .utils import (
     sanity_check_mm_encoder_outputs,
     scatter_mm_placeholders,
 )
+
+from vllm.v1.utils import create_sidecar_client
+from cornserve.sidecar.api import Sidecar
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -523,6 +527,42 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        # ----- Cornserve Integration -----
+        self.cornserve_config = vllm_config.cornserve_config
+        # note this only checks for existence of the env var, not its value
+        self.verify_encoder = "CORNSERVE_VLLM_VERIFY_ENCODER" in os.environ and "CORNSERVE_VLLM_DISABLE_MULTIMODAL" not in os.environ
+        architechtures = self.model_config.architectures
+        self.is_qwen3_omni_moe_thinker = "Qwen3OmniMoeForConditionalGeneration" in architechtures
+        self.is_qwen3_omni_moe_talker = "Qwen3OmniMoeTalkerForConditionalGeneration" in architechtures or "Qwen3OmniMoeTalkerVocoderForConditionalGeneration" in architechtures
+        self.num_deepstack_visual_indexes = 0
+        vision_config = getattr(
+            self.model_config.hf_config, "vision_config", None
+        )
+        if getattr(self.model_config.hf_config, "thinker_config", None):
+            vision_config = getattr(
+                self.model_config.hf_config.thinker_config, "vision_config", None
+            )
+        if vision_config and getattr(vision_config, "deepstack_visual_indexes", None):
+            self.num_deepstack_visual_indexes = len(
+                vision_config.deepstack_visual_indexes
+            )
+        
+
+        if self.cornserve_config:
+            self.sidecar_client: Sidecar = create_sidecar_client(vllm_config, False)
+        self.eos_token_id = self.model_config.hf_config.eos_token_id
+        if self.is_qwen3_omni_moe_talker:
+            assert self.eos_token_id is not None
+            # request_id -> previous step's hidden states tensor
+            self.do_hidden_states_caching = True
+            self._cached_past_hidden_states = dict[str, torch.Tensor]()
+            self._cached_trailing_text_embeds = dict[str, torch.Tensor]()
+            self._cached_thinker_hidden_states = dict[str, torch.Tensor]()
+            self.audio_residual_codes = defaultdict(list)
+        else:
+            # to make sure the attribute always exists
+            self.do_hidden_states_caching = False
+        # ----- End Cornserve Integration -----
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -644,6 +684,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            # ----- Cornserve Integration -----
+            # Also clean up per-request cached states used in Cornserve integration
+            if self.do_hidden_states_caching:
+                self._cached_past_hidden_states.pop(req_id, None)
+                self._cached_trailing_text_embeds.pop(req_id, None)
+                self._cached_thinker_hidden_states.pop(req_id, None)
+            if getattr(self.model, "is_audio_generator", False):
+                self.audio_residual_codes.pop(req_id, None)
+            # ----- End Cornserve Integration -----
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -723,6 +772,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         req_data = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
+            # ----- Cornserve Integration -----
+            req_state.step += 1
+            # ----- End Cornserve Integration -----
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
@@ -1819,6 +1871,134 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 is_embed=pos_info.is_embed,
             )
 
+    def _verify_encoder_outputs(self, scheduler_output: "SchedulerOutput") -> None:
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        if not scheduled_encoder_inputs:
+            return
+
+        logger.info("Cornserve: verifying encoder outputs")
+        if not self.sidecar_client:
+            raise RuntimeError("Sidecar is not conncected for Cornserve")
+        self._execute_mm_encoder(scheduler_output)
+
+        mm_hashes_pos: list[tuple[str, PlaceholderRange]] = []
+        for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+            for input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[input_id]
+                pos_info = mm_feature.mm_position
+                mm_hash = mm_feature.identifier
+                mm_hashes_pos.append((mm_hash, pos_info))
+                num_tokens = pos_info.length if pos_info.is_embed is None else int(sum(pos_info.is_embed))
+                assert mm_feature.data is not None
+                modality = mm_feature.data.modality
+                if pos_info.data_id:
+                    logger.info("Cornserve: trying to read %s", pos_info.data_id)
+                    received_num_tokens = 0
+                    output = self.sidecar_client.recv_sync(pos_info.data_id).to(self.device)
+                    if self.num_deepstack_visual_indexes and (modality == "image"
+                        or modality == "video"):
+                        output = output.view(-1, self.hidden_size * (1+self.num_deepstack_visual_indexes))
+                    received_num_tokens = output.size(0)
+                    logger.info("Cornserve: expecting %d received %d", num_tokens, received_num_tokens)
+                    if output.size(0) == num_tokens:
+                        embeds = scatter_mm_placeholders(output, is_embed=pos_info.is_embed)
+                        cached_output = self.encoder_cache[mm_hash]
+                        cached_flat = cached_output.view(-1)
+                        embeds_flat = embeds.view(-1)
+                        valid_mask = ~(torch.isnan(cached_flat) | torch.isnan(embeds_flat))
+                        sim = torch.cosine_similarity(
+                            cached_flat[valid_mask],
+                            embeds_flat[valid_mask],
+                            dim=0,
+                        )
+                        logger.info("Cornserve: similarity %f", sim)
+                        assert sim > 0.99, \
+                            f"Cornserve: Encoder output mismatch for {pos_info.data_id}\n" \
+                            f"cached_output: {cached_output}\n" \
+                            f"embeds: {embeds}\n" \
+                            f"similarity: {sim}\n"
+                    else:
+                        raise RuntimeError(
+                            "Cornserve: Received %d token count does not match expected %d",
+                            received_num_tokens,
+                            num_tokens,
+                        )
+
+    def _on_demand_execute_mm_encoder(self, scheduler_output: "SchedulerOutput") -> None:
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        if not scheduled_encoder_inputs:
+            return
+
+        # Get MM inputs in scheduler order
+        mm_kwargs, mm_hashes_pos = self._batch_mm_kwargs_from_scheduler(scheduler_output)
+        if not mm_kwargs:
+            return
+
+        # Partition into remote (has data_id) and native (no data_id)
+        # group (mm_kwargg, mm_hash, pos_info) 
+        mm_data_remote= []
+        mm_data_native = []
+
+        for mm_kwarg, (mm_hash, pos_info) in zip(mm_kwargs, mm_hashes_pos):
+            if pos_info.data_id:
+                mm_data_remote.append((mm_kwarg, mm_hash, pos_info))
+            else:
+                mm_data_native.append((mm_kwarg, mm_hash, pos_info))
+
+        logger.info("Cornserve: on-demand MM encoder (remote=%d, native=%d)", len(mm_data_remote), len(mm_data_native))
+
+        # Fetch remote encoder outputs
+        for mm_kwarg, mm_hash, pos_info in mm_data_remote:
+            num_tokens = pos_info.length if pos_info.is_embed is None else int(sum(pos_info.is_embed))
+            output = None
+
+            if self.sidecar_client:
+                output = self.sidecar_client.recv_sync(pos_info.data_id).to(self.device)
+                # for vision encoder with deepstack, we need to reshape the vision embeds
+                if self.num_deepstack_visual_indexes and (mm_kwarg.modality == "image"
+                    or mm_kwarg.modality == "video"):
+                    output = output.view(-1, self.hidden_size * (1+self.num_deepstack_visual_indexes))
+                if output is None:
+                    raise RuntimeError("Cornserve: failed to receive remote data for %s", pos_info.data_id)
+                if output.size(0) != num_tokens:
+                    raise ValueError(
+                        "Cornserve: remote data size mismatch (expected=%d, received=%d)",
+                        num_tokens,
+                        output.size(0),
+                    )
+            self.encoder_cache[mm_hash] = scatter_mm_placeholders(output, is_embed=pos_info.is_embed)  # type: ignore
+
+        # Encode native inputs
+        if mm_data_native:
+            skip_native_encoder = "CORNSERVE_VLLM_DISABLE_MULTIMODAL" in os.environ
+            if skip_native_encoder:
+                logger.warning("@@@ Cornserve: using random encoder inputs for native MM inputs")
+                dtype = self.dtype if isinstance(self.dtype, torch.dtype) else getattr(torch, self.dtype)
+                for mm_kwarg, mm_hash, pos_info in mm_data_native:
+                    num_tokens = pos_info.length if pos_info.is_embed is None else int(sum(pos_info.is_embed))
+                    output = torch.randn(num_tokens, self.hidden_size, device=self.device, dtype=dtype)
+                    self.encoder_cache[mm_hash] = scatter_mm_placeholders(output, is_embed=pos_info.is_embed)
+            else:
+                model = cast(SupportsMultiModal, self.model)
+                encoder_outputs = []
+                mm_kwargs_native = [item[0] for item in mm_data_native]
+                mm_hashes_pos_native = [(item[1:] ) for item in mm_data_native]
+
+                for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
+                    mm_kwargs_native,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    merge_by_field_config=model.merge_by_field_config,
+                ):
+                    curr_outputs = model.get_multimodal_embeddings(**mm_kwargs_group)
+                    sanity_check_mm_encoder_outputs(curr_outputs, expected_num_items=num_items)
+                    encoder_outputs.extend(curr_outputs)
+
+                # Cache in order
+                for (mm_hash, pos_info), output in zip(mm_hashes_pos_native, encoder_outputs):
+                    self.encoder_cache[mm_hash] = scatter_mm_placeholders(output, is_embed=pos_info.is_embed)
+
     def _gather_mm_embeddings(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2125,6 +2305,97 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
+    def _cache_hidden_states(
+        self,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
+    ) -> None:
+        """First slices the hidden states tensor based on the scheduled tokens."""
+        offset = 0
+        for req_id in self.input_batch.req_ids:
+            n_tok = scheduler_output.num_scheduled_tokens[req_id]
+            if n_tok == 0:
+                continue
+            hs_slice = hidden_states[offset : offset + n_tok]
+            offset += n_tok
+            self._cached_past_hidden_states[req_id] = hs_slice.cpu()
+
+    def get_request_position_mapping(
+        self,
+        scheduler_output: "SchedulerOutput",
+        target_req_id: str,
+    ) -> tuple[int, int, int, int]:
+        """
+        Returns:
+            batch_start: Starting index in the flattened batch
+            batch_end: Ending index in the flattened batch
+            req_start: Starting position in the original request
+            req_end: Ending position in the original request
+        """
+        batch_start = 0
+        for req_id in self.input_batch.req_ids:
+            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            if req_id == target_req_id:
+                req_state = self.requests[req_id]
+                req_start = req_state.num_computed_tokens
+                req_end = req_start + num_scheduled
+                batch_end = batch_start + num_scheduled
+                logger.debug("Cornserve: request %s position mapping: batch (%d, %d), req (%d, %d)",
+                             target_req_id, batch_start, batch_end, req_start, req_end)
+                return batch_start, batch_end, req_start, req_end
+
+            batch_start += num_scheduled
+
+        raise ValueError(f"Request {target_req_id} not found")
+
+    def _preprocess_qwen3_omni_talker_input_embeds(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> torch.Tensor:
+        # returns the thinker hidden states to pass into get_input_embeddings
+        # this creates the contiguous batching view of hidden states from per-request cached states
+        # first rebuild and save if not existing
+        batched_thinker_hidden_states = torch.zeros(
+            scheduler_output.total_num_scheduled_tokens,
+            2048, # hardcoded thinker hidden size for Qwen3 OmniTalker
+            dtype=self.dtype,
+            device=self.device,
+        )
+        for req_id in self.input_batch.req_ids:
+            if req_id not in self._cached_thinker_hidden_states:
+                sampling_params = self.requests[req_id].sampling_params
+                assert sampling_params is not None
+                extra_args = sampling_params.extra_args or {}
+                if "cornserve_hidden_states_recv_id" not in extra_args:
+                    raise RuntimeError(
+                        f"Cornserve: missing cornserve_hidden_states_recv_id "
+                        f"for request {req_id} "
+                        f"needed for Qwen3 OmniTalker thinker hidden states"
+                    )
+                recv_id = extra_args["cornserve_hidden_states_recv_id"]
+                chunk_id = 1
+                chunks = []
+                while True:
+                    chunk = self.sidecar_client.recv_sync(id=recv_id, chunk_id=chunk_id)
+                    if chunk is None:
+                        break
+                    chunk_id += 1
+                    chunks.append(chunk)
+                logger.debug("Cornserve: received %d thinker hidden states chunks for request %s", len(chunks), req_id)
+                thinker_hidden_states = torch.cat(chunks, dim=0).to(self.device)
+                self._cached_thinker_hidden_states[req_id] = thinker_hidden_states
+            else:
+                thinker_hidden_states = self._cached_thinker_hidden_states[req_id]
+            batch_mapping = self.get_request_position_mapping(scheduler_output, req_id)
+            batch_start, batch_end, req_start, req_end = batch_mapping
+            if req_end > thinker_hidden_states.shape[0]:
+                # decode
+                continue
+            batched_thinker_hidden_states[batch_start:batch_end] = \
+                thinker_hidden_states[req_start:req_end]
+        return batched_thinker_hidden_states
+
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2148,17 +2419,35 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             and not self.model_config.is_encoder_decoder
         ):
             # Run the multimodal encoder if any.
-            self._execute_mm_encoder(scheduler_output)
+            # ----- Cornserve Integration -----
+            if self.cornserve_config:
+                if self.verify_encoder:
+                    self._verify_encoder_outputs(scheduler_output)
+                else:
+                    self._on_demand_execute_mm_encoder(scheduler_output)
+            else:
+                self._execute_mm_encoder(scheduler_output)
+            # ----- Cornserve Integration -----
             mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
+            # ----- Cornserve Integration -----
+            input_embeds_extra_args = {}
+            # surgery to get the batch's thinker hidden states if needed
+            if self.is_qwen3_omni_moe_talker:
+                thinker_hidden_states = self._preprocess_qwen3_omni_talker_input_embeds(
+                    scheduler_output,
+                )
+                input_embeds_extra_args["thinker_hidden_states"] = thinker_hidden_states
             inputs_embeds_scheduled = self.model.get_input_embeddings(
                 self.input_ids.gpu[:num_scheduled_tokens],
                 multimodal_embeddings=mm_embeds,
                 is_multimodal=is_mm_embed,
+                **input_embeds_extra_args,
             )
+            # ----- Cornserve Integration -----
 
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
@@ -2501,6 +2790,84 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ) = self._preprocess(
                 scheduler_output, num_input_tokens, intermediate_tensors
             )
+            # ----- Cornserve Integration -----
+            # for Qwen3-Omni talker, we cannot put additional processing in get_input_embeddings
+            # because get_input_embeddings is request_id agnostic
+            # therefore, we do additional processing here
+            if getattr(self.model, "process_past_hidden_states", False):
+                assert inputs_embeds is not None
+                saved_residual_codes = {}
+                # we need to update the input_embeds for decoding requests
+                patched_input_embeds = torch.zeros_like(inputs_embeds)
+                offset = 0
+                for req_id in self.input_batch.req_ids:
+                    # figure out the number of *generated* tokens for this request
+                    req_state = self.requests[req_id]
+                    num_output_tokens = len(req_state.output_token_ids)
+                    current_req_num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    req_sampling_params = req_state.sampling_params
+                    assert req_sampling_params is not None
+                    extra_args = req_sampling_params.extra_args
+                    assert extra_args is not None
+                    if req_id not in self._cached_past_hidden_states or num_output_tokens == 0:
+                        logger.debug(
+                            f"Past hidden states not found for request %s"
+                            f" -- this should only happen for prefill",
+                            req_id,
+                        )
+                        patched_input_embeds[offset : offset + current_req_num_scheduled_tokens] = inputs_embeds[offset : offset + current_req_num_scheduled_tokens]
+                        offset += current_req_num_scheduled_tokens
+                        continue
+                    past_hidden_states = self._cached_past_hidden_states[req_id]
+                    if req_state.prompt_token_ids is None:
+                        raise ValueError("prompt_token_ids is required for talker models")
+                    if req_state.output_token_ids is None:
+                        raise ValueError("output_token_ids is required for talker models")
+
+                    if req_id not in self._cached_trailing_text_embeds:
+                        trailing_text_token_ids = extra_args["cornserve_thinker_output_token_ids"][1:]
+                        trailing_text_token_ids_tensor = torch.tensor(trailing_text_token_ids, dtype=torch.long, device=self.device)
+                        trailing_text_embeds = self.model.thinker_text_embed(trailing_text_token_ids_tensor)  # type: ignore
+                        self._cached_trailing_text_embeds[req_id] = trailing_text_embeds
+                    else:
+                        trailing_text_embeds = self._cached_trailing_text_embeds[req_id]
+
+                    generation_step = num_output_tokens - 1
+                    new_inputs_embeds, residual_codes = \
+                    self.model.prepare_inputs_from_past_hidden_states(  # type: ignore
+                        trailing_text_embeds,
+                        req_state.prompt_token_ids + req_state.output_token_ids,
+                        past_hidden_states,
+                        generation_step,
+                    )
+                    patched_input_embeds[offset : offset + current_req_num_scheduled_tokens] = new_inputs_embeds
+                    offset += current_req_num_scheduled_tokens
+                    saved_residual_codes[req_id] = (generation_step, residual_codes)
+                    self.audio_residual_codes[req_id].append(residual_codes)
+
+                    if extra_args is None:
+                        continue
+
+                    if ("cornserve_residual_codes_forward_id" in extra_args and
+                        "cornserve_residual_codes_forward_ranks" in extra_args):
+                        forward_id = extra_args["cornserve_residual_codes_forward_id"]
+                        forward_ranks = extra_args["cornserve_residual_codes_forward_ranks"]
+                        self.sidecar_client.send(
+                            data=residual_codes,
+                            id=forward_id,
+                            dst_sidecar_ranks=forward_ranks,
+                            chunk_id=generation_step,
+                            stream=True
+                        )
+                    elif ("cornserve_residual_codes_forward_id" in extra_args or 
+                          "cornserve_residual_codes_forward_ranks" in extra_args):
+                        logger.warning(
+                            f"Cornserve: incomplete residual codes"
+                            "transfer args for request %s: %s",
+                            req_id, extra_args
+                        )
+                inputs_embeds = patched_input_embeds
+            # ----- End Cornserve Integration -----
 
             uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
                 num_scheduled_tokens == self.input_batch.num_reqs * max_query_len
@@ -2557,6 +2924,66 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+                # ----- Cornserve Integration -----
+                if getattr(self.model, "return_all_hidden_states", False):
+                    # Qwen3 Omni thinker will stream 24'th layer hidden states to talker
+                    if self.is_qwen3_omni_moe_thinker and self.cornserve_config:
+                        ACCEPT_HIDDEN_LAYER = 24
+                        offset = 0
+                        for req_id in self.input_batch.req_ids:
+                            n_tok = scheduler_output.num_scheduled_tokens[req_id]
+                            if n_tok == 0:
+                                continue
+                            hs_slice = hidden_states[ACCEPT_HIDDEN_LAYER][offset : offset + n_tok]
+                            offset += n_tok
+                            req_state = self.requests[req_id]
+                            if req_state.sampling_params is None or req_state.sampling_params.extra_args is None:
+                                continue
+                            extra_args = req_state.sampling_params.extra_args
+                            if "cornserve_hidden_states_forward_id" not in extra_args or "cornserve_hidden_states_forward_ranks" not in extra_args:
+                                continue
+                            forward_id = extra_args["cornserve_hidden_states_forward_id"]
+                            forward_ranks = extra_args["cornserve_hidden_states_forward_ranks"]
+                            # chunk_id is offset by 1 for omni thinker
+                            chunk_id = req_state.step + 1
+                            self.sidecar_client.send(
+                                data=hs_slice,
+                                id=forward_id,
+                                dst_sidecar_ranks=forward_ranks,
+                                # hardcoded for thinker
+                                chunk_id=chunk_id,
+                                stream=True
+                            )
+                    hidden_states = hidden_states[-1]
+                else:
+                    # regular forwarding of last layer hidden states
+                    offset = 0
+                    for req_id in self.input_batch.req_ids:
+                        n_tok = scheduler_output.num_scheduled_tokens[req_id]
+                        if n_tok == 0:
+                            continue
+                        hs_slice = hidden_states[offset : offset + n_tok]
+                        req_state = self.requests[req_id]
+                        if req_state.sampling_params is None or req_state.sampling_params.extra_args is None:
+                            continue
+                        extra_args = req_state.sampling_params.extra_args
+                        if "cornserve_hidden_states_forward_id" not in extra_args or "cornserve_hidden_states_forward_ranks" not in extra_args:
+                            continue
+                        forward_id = extra_args["cornserve_hidden_states_forward_id"]
+                        forward_ranks = extra_args["cornserve_hidden_states_forward_ranks"]
+                        chunk_id = req_state.step
+                        self.sidecar_client.send(
+                            data=hs_slice,
+                            id=forward_id,
+                            dst_sidecar_ranks=forward_ranks,
+                            chunk_id=chunk_id,
+                            stream=True
+                        )
+
+            if self.do_hidden_states_caching:
+                # Qwen3 Omni Talker requires previous step's hidden states for code prodectior
+                self._cache_hidden_states(scheduler_output, hidden_states)
+            # ----- End Cornserve Integration -----
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -2719,6 +3146,28 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("EPLB"):
             self.eplb_step()
 
+        # ----- Cornserve Integration -----
+        # for Qwen3-Omni Talker with Code2wav, generate audio chunks
+        if getattr(self.model, "is_audio_generator", False):
+            wavs = []
+            for req_id in self.input_batch.req_ids:
+                req = self.requests[req_id]
+                stopped = self.check_stop(req, self.eos_token_id)  # type: ignore
+                input_residual_codes = self.audio_residual_codes[req_id]
+                maybe_wav = self.model.generate_audio_chunk(  # type: ignore
+                    input_residual_codes,
+                    finished=stopped,
+                )
+                if maybe_wav is not None:
+                    wavs.append(maybe_wav.reshape(-1).detach().cpu().float())
+                else:
+                    wavs.append(None)
+            num_wavs = sum(1 for w in wavs if w is not None)
+            logger.debug("Cornserve: Generated %d audio chunks", num_wavs)
+        else:
+            wavs = []
+        # ----- End Cornserve Integration -----
+
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2728,6 +3177,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            wavs=wavs,
         )
 
         if not self.use_async_scheduling:
@@ -3546,6 +3996,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
+                # ----- Cornserve Integration -----
+                # this is the Qwen3-Omni thinker path
+                if getattr(self.model, "return_all_hidden_states", False):
+                    logger.debug("Stripping additional hidden states from output")
+                    hidden_states = hidden_states[-1]
+                # ----- End Cornserve Integration -----
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
@@ -4733,3 +5189,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.transfer_event.record()
         self.transfer_event.synchronize()
         return pinned.tolist()
+
+    def check_stop(self, req: CachedRequestState, eos_token_id: int) -> bool:
+        """Cornserve utils for checking whether a request will stop.
+
+        Used to determine whether to generate the last chunk of an audio
+        """
+        sampling_params = req.sampling_params
+        assert sampling_params is not None
+        num_output_tokens = len(req.output_token_ids)
+        max_tokens = sampling_params.max_tokens if sampling_params.max_tokens is not None else self.max_model_len
+        if num_output_tokens >= self.max_model_len or num_output_tokens >= max_tokens:
+            return True
+        last_token_id = req.output_token_ids[-1]
+        if last_token_id == eos_token_id or last_token_id in (sampling_params.stop_token_ids or ()):
+            return True
+        return False

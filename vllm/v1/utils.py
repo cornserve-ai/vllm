@@ -34,6 +34,11 @@ if TYPE_CHECKING:
     from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
 
+from cornserve.sidecar.api import Sidecar
+from cornserve.sidecar.schema import SidecarConfig
+from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
 logger = init_logger(__name__)
 
 T = TypeVar("T")
@@ -409,3 +414,29 @@ def tensor_data(tensor: torch.Tensor) -> memoryview:
         A memoryview of the tensor data as uint8.
     """
     return tensor.flatten().contiguous().view(torch.uint8).numpy().data
+
+def create_sidecar_client(vllm_config: VllmConfig, is_control_path: bool) -> Sidecar:
+    architechtures = vllm_config.model_config.architectures
+    is_qwen3_omni_moe_talker = "Qwen3OmniMoeTalkerForConditionalGeneration" in architechtures or "Qwen3OmniMoeTalkerVocoderForConditionalGeneration" in architechtures
+    send_hidden_size = vllm_config.model_config.get_hidden_size()
+    # hardcoded thinker hidden size value for qwen3-omni-moe-talker
+    if is_qwen3_omni_moe_talker:
+        recv_hidden_size = 2048
+    else:
+        recv_hidden_size = vllm_config.model_config.get_hidden_size()
+    logger.info(f"Sidecar send_hidden_size: {send_hidden_size}, recv_hidden_size: {recv_hidden_size}")
+
+    cornserve_config = vllm_config.cornserve_config
+    rank = 0 if is_control_path else get_tensor_model_parallel_rank()
+    sidecar_client = Sidecar(
+        SidecarConfig(
+            sidecar_rank=cornserve_config.sidecar_ranks[rank],
+            group=cornserve_config.sidecar_ranks,
+            recv_tensor_shape=(-1, recv_hidden_size),
+            recv_tensor_dtype=vllm_config.model_config.dtype,
+            send_tensor_shape=(-1, send_hidden_size),
+            send_tensor_dtype=vllm_config.model_config.dtype,
+        )
+    )
+    return sidecar_client
+

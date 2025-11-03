@@ -46,6 +46,10 @@ class CachedRequestState:
     lora_request: LoRARequest | None = None
     prompt_embeds: torch.Tensor | None = None
 
+    # ----- Cornserve fields -----
+    step: int = 0
+    # ----- End Cornserve fields -----
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds

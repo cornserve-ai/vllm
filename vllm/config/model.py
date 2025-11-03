@@ -538,6 +538,52 @@ class ModelConfig:
         self.hf_config = hf_config
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
+
+        # ----- Cornserve Integration -----
+        use_talker_text_config = (
+            hasattr(hf_config, '_use_talker_text_config') or
+            (self.hf_overrides and self.hf_overrides.get('_use_talker_text_config'))
+        )
+        use_talker_eos_token = (
+            hasattr(hf_config, '_use_talker_eos_token') or
+            (self.hf_overrides and self.hf_overrides.get('_use_talker_eos_token'))
+        )
+
+        if not hasattr(hf_config, 'talker_config'):
+            if use_talker_text_config or use_talker_eos_token:
+                logger.warning("--run-talker specified but model has no talker_config")
+        else:
+            # Patch text_config with talker's text_config
+            if use_talker_text_config:
+                talker_text_config = hf_config.talker_config.text_config
+                preserved_attrs = {'architectures', 'model_type', '_use_talker_text_config', '_use_talker_eos_token'}
+                preserved_values = {attr: getattr(hf_config, attr) for attr in preserved_attrs if hasattr(hf_config, attr)}
+
+                for attr in dir(talker_text_config):
+                    if not attr.startswith('_') and attr not in preserved_attrs:
+                        try:
+                            setattr(hf_config, attr, getattr(talker_text_config, attr))
+                        except Exception:
+                            pass
+
+                for attr, value in preserved_values.items():
+                    try:
+                        setattr(hf_config, attr, value)
+                    except Exception:
+                        pass
+
+                logger.info(f"Patched hf_config to use talker text_config (hidden_size={talker_text_config.hidden_size})")
+
+            # Override eos_token_id with talker's codec_eos_token_id
+            if use_talker_eos_token:
+                if hasattr(hf_config.talker_config, 'codec_eos_token_id'):
+                    hf_config.eos_token_id = hf_config.talker_config.codec_eos_token_id
+                    hf_config._use_talker_eos_token = True
+                    logger.info(f"Overriding eos_token_id to {hf_config.eos_token_id}")
+                else:
+                    logger.warning("talker_config has no codec_eos_token_id")
+        # ----- End Cornserve Integration -----
+
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None

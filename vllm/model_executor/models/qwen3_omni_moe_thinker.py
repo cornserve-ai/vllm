@@ -618,9 +618,12 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        # ----- Cornserve Integration -----
+        all_hidden_states = []
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
+            all_hidden_states.append(hidden_states)
             layer_idx = layer_idx + self.start_layer
 
             hidden_states, residual = layer(
@@ -642,7 +645,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        all_hidden_states.append(hidden_states)
+        return all_hidden_states
+        # ----- End Cornserve Integration -----
 
 
 class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
@@ -1098,6 +1103,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             "thinker.": "",
         }
     )
+
+    # ----- Cornserve Integration -----
+    return_all_hidden_states = True
+    # ----- End Cornserve Integration -----
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

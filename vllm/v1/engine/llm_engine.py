@@ -93,6 +93,21 @@ class LLMEngine:
         else:
             tokenizer = init_tokenizer_from_configs(self.model_config)
 
+            # ----- Cornserve Integration -----
+            # Patch tokenizer's eos_token_id if running talker mode
+            # The model config's eos_token_id was already overridden in model.py
+            # but the tokenizer has its own eos_token_id that needs patching
+            if (hasattr(self.model_config.hf_config, '_use_talker_eos_token') and
+                self.model_config.hf_config._use_talker_eos_token):
+                config_eos = self.model_config.hf_config.eos_token_id
+                if tokenizer.eos_token_id != config_eos:
+                    logger.info(
+                        f"Overriding tokenizer.eos_token_id from {tokenizer.eos_token_id} "
+                        f"to {config_eos} for talker mode"
+                    )
+                    tokenizer.eos_token_id = config_eos
+            # ----- End Cornserve Integration -----
+
         self.processor = Processor(self.vllm_config, tokenizer)
         self.io_processor = get_io_processor(
             self.vllm_config,

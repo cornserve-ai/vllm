@@ -45,6 +45,7 @@ from .interfaces import (
     supports_multimodal_raw_input_only,
     supports_pp,
     supports_transcription,
+    requires_past_hidden_states_processing,
 )
 from .interfaces_base import (
     get_default_pooling_type,
@@ -370,6 +371,16 @@ _MULTIMODAL_MODELS = {
         "qwen3_omni_moe_thinker",
         "Qwen3OmniMoeThinkerForConditionalGeneration",
     ),
+    # ----- Cornserve Integration -----
+    "Qwen3OmniMoeTalkerForConditionalGeneration": (
+        "qwen3_omni_moe_talker",
+        "Qwen3OmniMoeTalkerForConditionalGeneration",
+    ),
+    "Qwen3OmniMoeTalkerVocoderForConditionalGeneration": (
+        "qwen3_omni_moe_talker",
+        "Qwen3OmniMoeTalkerVocoderForConditionalGeneration",
+    ),
+    # ----- End Cornserve Integration -----
     "Qwen3VLForConditionalGeneration": ("qwen3_vl", "Qwen3VLForConditionalGeneration"),  # noqa: E501
     "Qwen3VLMoeForConditionalGeneration": (
         "qwen3_vl_moe",
@@ -502,6 +513,9 @@ class _ModelInfo:
     supports_mamba_prefix_caching: bool
     supports_transcription: bool
     supports_transcription_only: bool
+    # ----- Cornserve Integration -----
+    past_hidden_states_processing: bool
+    # ----- End Cornserve Integration -----
 
     @staticmethod
     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
@@ -528,6 +542,9 @@ class _ModelInfo:
                 supports_transcription(model) and model.supports_transcription_only
             ),
             has_noops=has_noops(model),
+            # ----- Cornserve Integration -----
+            past_hidden_states_processing=requires_past_hidden_states_processing(model),
+            # ----- End Cornserve Integration -----
         )
 
 

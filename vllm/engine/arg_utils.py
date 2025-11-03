@@ -52,6 +52,7 @@ from vllm.config import (
     SpeculativeConfig,
     StructuredOutputsConfig,
     VllmConfig,
+    CornserveConfig,
     get_attr_docs,
 )
 from vllm.config.cache import (
@@ -348,6 +349,12 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
 class EngineArgs:
     """Arguments for vLLM engine."""
 
+    # ----- Cornserve Integration -----
+    cornserve_sidecar_ranks: list[int] | None = None
+    cornserve_scheduler_policy: str = "CORNSERVE"
+    cornserve_verify_encoder: bool = False
+    # ----- End Cornserve Integration -----
+
     model: str = ModelConfig.model
     served_model_name: str | list[str] | None = ModelConfig.served_model_name
     tokenizer: str | None = ModelConfig.tokenizer
@@ -537,6 +544,15 @@ class EngineArgs:
     model_impl: str = ModelConfig.model_impl
     override_attention_dtype: str = ModelConfig.override_attention_dtype
 
+    # ----- Cornserve Integration -----
+    # Qwen3-Omni specific: run only the talker model
+    # When enabled, this automatically:
+    # 1. Overrides architectures to Qwen3OmniMoeTalkerForConditionalGeneration
+    # 2. Patches hf_config to use talker_config.text_config (hidden_size=1024)
+    run_talker: bool = False
+    run_vocoder: bool = False
+    # ----- End Cornserve Integration -----
+
     calculate_kv_scales: bool = CacheConfig.calculate_kv_scales
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
@@ -589,6 +605,33 @@ class EngineArgs:
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
+
+        # ----- Cornserve Integration -----
+        cornserve_group = parser.add_argument_group(
+            title="CornserveConfig",
+            description=CornserveConfig.__doc__,
+        )
+        cornserve_group.add_argument(
+            "--cornserve-sidecar-ranks",
+            type=int,
+            nargs="+",
+            default = [],
+            help = "List of integer ranks for sidecar servers."
+        )
+        cornserve_group.add_argument(
+            "--cornserve-scheduler-policy",
+            type=str,
+            choices=["FCFS", "CORNSERVE"],
+            default="CORNSERVE",
+            help="Scheduler policy for cornserve."
+        )
+        cornserve_group.add_argument(
+            "--cornserve-verify-encoder",
+            action="store_true",
+            default=False,
+            help="Whether to verify the encoder outputs."
+        )
+        # --- End Cornserve Integration -----
 
         # Model arguments
         model_kwargs = get_kwargs(ModelConfig)
@@ -682,6 +725,24 @@ class EngineArgs:
         model_group.add_argument(
             "--io-processor-plugin", **model_kwargs["io_processor_plugin"]
         )
+
+        # ----- Cornserve Integration -----
+        # Qwen3-Omni specific argument
+        model_group.add_argument(
+            "--run-talker",
+            action="store_true",
+            default=False,
+            help="[Qwen3-Omni only] Run only the talker model. "
+            "Automatically loads Qwen3OmniMoeTalkerForConditionalGeneration "
+            "and patches config to use talker's text_config (hidden_size=1024)."
+        )
+        model_group.add_argument(
+            "--run-vocoder",
+            action="store_true",
+            default=False,
+            help="[Qwen3-Omni only] Run the vocoder model together with the talker."
+        )
+        # ----- End Cornserve Integration -----
 
         # Model loading arguments
         load_kwargs = get_kwargs(LoadConfig)
@@ -1137,6 +1198,51 @@ class EngineArgs:
         )
         return engine_args
 
+    def _patch_config_for_talker(self, run_vocoder: bool = False) -> None:
+        """Patch hf_overrides to use talker architecture and config.
+
+        This modifies the hf_overrides to:
+        1. Override architectures to use Qwen3OmniMoeTalkerForConditionalGeneration
+        2. Set text_config to talker_config.text_config (hidden_size=1024)
+
+        This ensures model runner allocates buffers with correct dimensions.
+        """
+        # Override architecture to load talker instead of full model
+        if self.hf_overrides is None:
+            self.hf_overrides = {}
+
+        new_architecture = "Qwen3OmniMoeTalkerForConditionalGeneration" if not run_vocoder else "Qwen3OmniMoeTalkerVocoderForConditionalGeneration"
+
+        if "architectures" not in self.hf_overrides:
+            self.hf_overrides["architectures"] = [
+                new_architecture
+            ]
+            logger.info(
+                "Overriding architectures to ['%s']", new_architecture
+            )
+
+        # The key patch: override text_config to use talker's config
+        # This will be applied by ModelConfig and ensures hidden_size=1024
+        # We use a special marker that will be resolved when loading the HF config
+        self.hf_overrides["_use_talker_text_config"] = True
+
+        # Override eos_token_id to use talker's codec_eos_token_id (2150)
+        # instead of thinker's eos_token_id (151645)
+        # This matches HF implementation line 1165
+        self.hf_overrides["_use_talker_eos_token"] = True
+
+    def create_cornserve_config(self) -> CornserveConfig | None:
+        if not self.cornserve_sidecar_ranks:
+            return None
+        assert len(self.cornserve_sidecar_ranks) == self.tensor_parallel_size, \
+        "Number of sidecar ranks must match tensor parallel size."
+        
+        return CornserveConfig(
+            sidecar_ranks=self.cornserve_sidecar_ranks,
+            scheduler_policy=self.cornserve_scheduler_policy,
+            verify_encoder=self.cornserve_verify_encoder,
+        )
+
     def create_model_config(self) -> ModelConfig:
         # gguf file needs a specific model loader and doesn't use hf_repo
         if check_gguf_file(self.model):
@@ -1168,6 +1274,14 @@ class EngineArgs:
             )
 
             self.mm_encoder_tp_mode = "data"
+
+        # ----- Cornserve Integration -----
+        # Handle --run-talker: patch config to use talker architecture
+        if self.run_talker:
+            self._patch_config_for_talker(self.run_vocoder)
+            # Skip multimodal profiling since talker doesn't run encoders
+            self.skip_mm_profiling = True
+        # ----- End Cornserve Integration -----
 
         return ModelConfig(
             model=self.model,
@@ -1307,6 +1421,9 @@ class EngineArgs:
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
+        # ----- Cornserve Integration -----
+        cornserve_config = self.create_cornserve_config()
+        # ----- End Cornserve Integration -----
 
         # Check if the model is a speculator and override model/tokenizer/config
         # BEFORE creating ModelConfig, so the config is created with the target model
@@ -1703,7 +1820,11 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
+            # ----- Cornserve Integration -----
+            cornserve_config=cornserve_config,
         )
+        logger.info("Cornserve Config: %s", cornserve_config)
+        # ----- End Cornserve Integration -----
 
         return config
 

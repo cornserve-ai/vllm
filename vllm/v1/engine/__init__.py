@@ -71,6 +71,10 @@ class EngineCoreRequest(
 
     trace_headers: Mapping[str, str] | None = None
 
+    # ----- Cornserve Integration -----
+    otel_carrier: dict | None = None
+    # ----- End Cornserve Integration -----
+
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
@@ -121,6 +125,11 @@ class EngineCoreOutput(
     trace_headers: Mapping[str, str] | None = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+
+    # ----- Cornserve Integration -----
+    # audio chunk (torch.Tensor will be converted to WAV bytes in output_processor)
+    wav: torch.Tensor | None = None
+    # ----- End Cornserve Integration -----
 
     @property
     def finished(self) -> bool:

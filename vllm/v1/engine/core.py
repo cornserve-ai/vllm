@@ -65,7 +65,12 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
+from cornserve.tracing import configure_otel
+from opentelemetry import trace, propagate
+
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
+propagator = propagate.get_global_textmap()
 
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -83,6 +88,11 @@ class EngineCore:
         log_stats: bool,
         executor_fail_callback: Callable | None = None,
     ):
+        # ----- Cornserve Integration -----
+        if vllm_config.cornserve_config:
+            configure_otel(f"vLLM{str(vllm_config.cornserve_config.sidecar_ranks).replace(' ', '')}")
+        # ----- End Cornserve Integration -----
+
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
@@ -536,6 +546,13 @@ class EngineCore:
             )
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        # ----- Cornserve Integration -----
+        if request.otel_carrier:
+            span_context = propagator.extract(request.otel_carrier)
+            span = tracer.start_span("EngineCore.add_request", context=span_context)
+            span.set_attribute("max_tokens", req.max_tokens)
+            req.span = span
+        # ----- End Cornserve Integration -----
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

@@ -25,6 +25,18 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, LoRARequestStates, RequestStateStats
 
 
+import base64
+
+# ----- Cornserve Integration -----
+def pcm16_base64(wav_chunk: torch.Tensor) -> str:
+    # Expect shape (..., T). Flatten to 1-D.
+    x = wav_chunk.reshape(-1)
+    x = torch.clamp(x, -1.0, 1.0)
+    pcm16 = (x * 32767.0).to(torch.int16).cpu().numpy().tobytes()
+    return base64.b64encode(pcm16).decode("ascii")
+# ----- End Cornserve Integration -----
+
+
 class RequestOutputCollector:
     """
     Collects streamed RequestOutputs per individual request,
@@ -192,6 +204,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        wav: str | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -206,7 +219,9 @@ class RequestState:
                 request_id, [self._new_pooling_output(pooling_output)], finished
             )
 
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        # ----- Cornserve Integration -----
+        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, wav)
+        # ----- End Cornserve Integration -----
 
         if self.parent_req is None:
             outputs = [output]
@@ -269,6 +284,9 @@ class RequestState:
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
+        # ----- Cornserve Integration -----
+        wav: str | None = None,
+        # ----- End Cornserve Integration -----
     ) -> CompletionOutput:
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
@@ -293,6 +311,9 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            # ----- Cornserve Integration -----
+            wav=wav,
+            # ----- End Cornserve Integration -----
         )
 
     def _new_pooling_output(
@@ -433,6 +454,12 @@ class OutputProcessor:
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
+            # ----- Cornserve Integration -----
+            # Convert audio tensor to WAV file bytes
+            wav = None
+            if engine_core_output.wav is not None:
+                wav = pcm16_base64(engine_core_output.wav)
+            # ----- End Cornserve Integration -----
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
 
@@ -458,6 +485,9 @@ class OutputProcessor:
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                # ----- Cornserve Integration -----
+                wav,
+                # ----- End Cornserve Integration -----
             ):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().

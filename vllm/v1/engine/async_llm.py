@@ -48,7 +48,14 @@ from vllm.v1.metrics.loggers import (
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
+import json
+from cornserve.sidecar.api import Sidecar
+from opentelemetry import trace, propagate
+from vllm.v1.utils import create_sidecar_client
+
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
+propagator = propagate.get_global_textmap()
 
 
 class AsyncLLM(EngineClient):
@@ -113,6 +120,21 @@ class AsyncLLM(EngineClient):
         else:
             tokenizer = init_tokenizer_from_configs(self.model_config)
 
+            # ----- Cornserve Integration -----
+            # Patch tokenizer's eos_token_id if running talker mode
+            # The model config's eos_token_id was already overridden in model.py
+            # but the tokenizer has its own eos_token_id that needs patching
+            if (hasattr(self.model_config.hf_config, '_use_talker_eos_token') and
+                self.model_config.hf_config._use_talker_eos_token):
+                config_eos = self.model_config.hf_config.eos_token_id
+                if tokenizer.eos_token_id != config_eos:
+                    logger.info(
+                        f"Overriding tokenizer.eos_token_id from {tokenizer.eos_token_id} "
+                        f"to {config_eos} for talker mode"
+                    )
+                    tokenizer.eos_token_id = config_eos
+            # ----- End Cornserve Integration -----
+
         self.processor = Processor(self.vllm_config, tokenizer)
         self.io_processor = get_io_processor(
             self.vllm_config,
@@ -176,6 +198,12 @@ class AsyncLLM(EngineClient):
             )
         else:
             self.profiler = None
+
+        # ----- Cornserve Integration -----
+        self.cornserve_config = vllm_config.cornserve_config
+        if self.cornserve_config:
+            self.sidecar_client: Sidecar = create_sidecar_client(vllm_config, True)
+        # ----- End Cornserve Integration -----
 
     @classmethod
     @deprecate_kwargs(
@@ -347,6 +375,7 @@ class AsyncLLM(EngineClient):
     # requests we don't need to send multiple messages to core proc,
     # and so we don't need multiple streams which then get
     # re-multiplexed in the API server anyhow.
+    @tracer.start_as_current_span(name="AsyncLLM.generate")
     async def generate(
         self,
         prompt: EngineCoreRequest | PromptType,
@@ -374,6 +403,99 @@ class AsyncLLM(EngineClient):
         The caller of generate() iterates the returned AsyncGenerator,
         returning the RequestOutput back to the caller.
         """
+
+        # ----- Cornserve Integration -----
+        assert isinstance(prompt, EngineCoreRequest)
+        # this disables beam search and audio transcription/translation
+        request = prompt
+        span = trace.get_current_span()
+        span.set_attribute("request_id", request_id)
+        if self.cornserve_config \
+                and (mm_features := request.mm_features):
+            # check data_ids
+            coros = []
+            for feature in mm_features:
+                p = feature.mm_position
+                if p.data_id is not None:
+                    logger.info("Cornserve: trying to receive data_id %s", p.data_id)
+                    coros.append(self.sidecar_client.recv(p.data_id))
+            if coros:
+                # wait for all coroutines to finish
+                span.add_event("recv_all.start")
+                await asyncio.gather(*coros)
+                span.add_event("recv_all.done")
+
+        def mark_done_dataforwards():
+            if not self.cornserve_config or not request.mm_features:
+                return
+            for feature in request.mm_features:
+                p = feature.mm_position
+                if p.data_id is not None:
+                    logger.debug("Cornserve: marking done request %s for data_id %s", request.request_id, p.data_id)
+                    self.sidecar_client.mark_done_sync(p.data_id)
+
+        def mark_done_hidden_states(extra_args: dict[str, Any]):
+            if not self.cornserve_config or "cornserve_hidden_states_recv_id" not in extra_args:
+                return
+            recv_id = extra_args["cornserve_hidden_states_recv_id"]
+            num_chunks = extra_args.get("cornserve_hidden_states_recv_num_chunks", 0)
+            for chunk_id in range(num_chunks):
+                logger.debug("Cornserve: marking done request %s for hidden_states_recv_id %s chunk_id %d", request.request_id, recv_id, chunk_id)
+                self.sidecar_client.mark_done_sync(recv_id, chunk_id=chunk_id)
+
+        carrier = {}
+        propagator.inject(carrier)
+        request.otel_carrier = carrier
+
+        # Cornserve relies on vllm_xargs, which lives within sampling_params
+        logger.debug("Request sampling_params: %s", request.sampling_params)
+        assert request.sampling_params is not None
+        extra_args = request.sampling_params.extra_args or {}
+
+        # preprocessing for parsing ranks
+        new_args = {}
+        for k, v in extra_args.items():
+            if k.startswith("cornserve_") and k.endswith("_ranks"):
+                new_args[k] = json.loads(v)
+        extra_args.update(new_args)
+        logger.debug("Request sampling_params after parsing ranks: %s", request.sampling_params)
+
+        # talker as consumer
+        if "cornserve_hidden_states_recv_id" in extra_args:
+            # chunk 0 is control args, we'll insert them directly into sampling_params
+            # see vllm/v1/core/sched/scheduler.py, the rest are hidden states -- handled by gpu_model_runner
+            recv_id = extra_args["cornserve_hidden_states_recv_id"]
+            forward_args = await self.sidecar_client.recv(id=recv_id, chunk_id=0)
+            # here we also need to patch the last token id to be the first thinker output token id
+            if "cornserve_thinker_output_token_ids" not in forward_args:
+                raise ValueError("Missing cornserve_thinker_output_token_ids in forward_args")
+            talker_token_ids = forward_args["cornserve_thinker_output_token_ids"]
+            assert request.prompt_token_ids is not None
+            # we need to replace the last token id ('\n') with the first thinker output token id
+            request.prompt_token_ids[-1] = talker_token_ids[0]
+            extra_args.update(forward_args)
+            # Update the request's sampling_params, not the function parameter
+            chunk_id = 1
+            while True:
+                chunk = await self.sidecar_client.recv(id=recv_id, chunk_id=chunk_id)
+                if chunk is None:
+                    break
+                chunk_id += 1
+            # we also book keep the number of chunks we received for mark_done
+            extra_args["cornserve_hidden_states_recv_num_chunks"] = chunk_id
+            logger.debug("Got %d chunks of hidden states for recv_id %s", chunk_id, recv_id)
+        # decode instance as consumer
+        if "cornserve_kv_transfer_params_recv_id" in extra_args:
+            recv_id = extra_args["cornserve_kv_transfer_params_recv_id"]
+            kv_transfer_params = await self.sidecar_client.recv(id=recv_id, chunk_id=0)
+            if kv_transfer_params is None:
+                raise ValueError("Failed to receive cornserve_kv_transfer_params")
+            extra_args.update(kv_transfer_params)
+            logger.debug("Received kv_transfer_params for recv_id %s: %s", recv_id, kv_transfer_params)
+        sampling_params.extra_args = extra_args
+        request.sampling_params.extra_args = extra_args
+        logger.debug("Request sampling_params: %s", request.sampling_params)
+        # ----- End Cornserve Integration -----
 
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill
@@ -427,6 +549,25 @@ class AsyncLLM(EngineClient):
                 assert isinstance(out, RequestOutput)
                 yield out
 
+            # ----- Cornserve Integration -----
+            # prefill instance as producer
+            if ("cornserve_kv_transfer_params_forward_id" in extra_args and
+                "cornserve_kv_transfer_params_forward_ranks" in extra_args):
+                logger.info("Cornserve: sending kv_transfer_params %s", out.kv_transfer_params)
+                forward_id = extra_args["cornserve_kv_transfer_params_forward_id"]
+                forward_ranks = extra_args["cornserve_kv_transfer_params_forward_ranks"]
+                data = {"kv_transfer_params": out.kv_transfer_params}
+                self.sidecar_client.send(
+                    data=data,
+                    id=forward_id,
+                    dst_sidecar_ranks=forward_ranks,
+                )
+            elif ("cornserve_kv_transfer_params_forward_id" in extra_args or
+                  "cornserve_kv_transfer_params_forward_ranks" in extra_args):
+                logger.warning("Cornserve: only one of forward_id or forward_ranks is specified, skipping kv_transfer_params sending")
+            # ----- End Cornserve Integration -----
+
+
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
         # we abort the request if we end up here.
@@ -454,6 +595,11 @@ class AsyncLLM(EngineClient):
             if self.log_requests:
                 logger.info("Request %s failed.", request_id)
             raise EngineGenerateError() from e
+        finally:
+            # ----- Cornserve Integration -----
+            mark_done_dataforwards()
+            mark_done_hidden_states(extra_args)
+            # ----- End Cornserve Integration -----
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""

@@ -101,7 +101,9 @@ _LONG_INFO = torch.iinfo(torch.long)
 
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does allow extra fields
-    model_config = ConfigDict(extra="allow")
+    # ----- Cornserve Integration -----
+    model_config = ConfigDict(extra="allow", ser_json_bytes="base64", val_json_bytes="base64")
+    # ----- End Cornserve Integration -----
 
     # Cache class field names
     field_names: ClassVar[set[str] | None] = None
@@ -529,6 +531,12 @@ class ResponsesRequest(OpenAIBaseModel):
         data["input"] = processed_input
         return data
 
+class CornserveKVTransferSendParams(BaseModel):
+    id: str
+    receiver_sidecar_ranks: list[list[int]]
+
+class CornserveKVTransferRecvParams(BaseModel):
+    id: str
 
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
@@ -776,6 +784,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
     )
+    # ----- Cornserve Integration -----
+    cornserve_return_audio: bool = Field(
+        default=False,
+        description="If true, the response will only include audio data."
+                    " This should only be set for audio generation models.",
+    )
+    cornserve_kv_transfer_send_params: CornserveKVTransferSendParams | None = Field(
+        default=None,
+        description="KVTransfer parameters used for sending KV cache "
+                    "to decode instances in Cornserve.",
+    )
+
+    cornserve_kv_transfer_recv_params: CornserveKVTransferRecvParams | None = Field(
+        default=None,
+        description="KVTransfer parameters used for receiving KV cache "
+                    "from prefill instances in Cornserve.",
+    )
+    # ----- End Cornserve Integration -----
 
     vllm_xargs: dict[str, str | int | float] | None = Field(
         default=None,
@@ -2179,6 +2205,9 @@ class DeltaMessage(OpenAIBaseModel):
     content: str | None = None
     reasoning_content: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+    # ----- Cornserve Integration -----
+    audio: OpenAIChatCompletionAudio | None = None
+    # ----- End Cornserve Integration -----
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):

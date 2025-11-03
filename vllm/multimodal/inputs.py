@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
 from typing import (
-    TYPE_CHECKING,
     Any,
+    Generic,
     Literal,
     Optional,
+    TYPE_CHECKING,
     TypeAlias,
     TypedDict,
     Union,
@@ -105,6 +106,15 @@ The number of data items allowed per modality is restricted by
 `--limit-mm-per-prompt`.
 """
 
+class DataForward(Generic[_T]):
+    """A wrapper class for data forwared in Cornserve."""
+    def __init__(self, id: str, data: _T) -> None:
+        self.id = id
+        # this field stores the original data
+        self.data = data
+    
+    def __repr__(self) -> str:
+        return f"DataForward(id={self.id}, data={self.data})"
 
 @final
 class MultiModalDataBuiltins(TypedDict, total=False):
@@ -139,7 +149,7 @@ The UUID will be used to identify the item for all caching purposes
 """
 
 
-@dataclass(frozen=True)
+@dataclass()
 class PlaceholderRange:
     """
     Placeholder location information for multi-modal data.
@@ -167,6 +177,12 @@ class PlaceholderRange:
     A boolean mask of shape `(length,)` indicating which positions
     between `offset` and `offset + length` to assign embeddings to.
     """
+    # ----- Cornserve Integration -----
+    data_id: Optional[str] = None
+    """
+    Dataforwad ID used in Cornserve.
+    """
+    # ----- End Cornserve Integration -----
 
     def get_num_embeds(self) -> int:
         if self.is_embed is None:

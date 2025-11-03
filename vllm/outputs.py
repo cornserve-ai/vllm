@@ -46,6 +46,9 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    # ----- Cornserve Integration -----
+    wav: str | None = None
+    # ----- End Cornserve Integration -----
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -59,6 +62,7 @@ class CompletionOutput:
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "
             f"stop_reason={self.stop_reason})"
+            f"wav_length={len(self.wav) if self.wav else None})"
         )
 
 
@@ -121,6 +125,9 @@ class RequestOutput:
         *,
         multi_modal_placeholders: MultiModalPlaceholderDict | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        # ----- Cornserve Integration -----
+        wav: str | None = None,
+        # ----- End Cornserve Integration -----
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -142,6 +149,7 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        self.wav = wav
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
@@ -166,6 +174,12 @@ class RequestOutput:
                         )
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
+                        # ----- Cornserve Integration -----
+                        if completion.wav and next_completion.wav:
+                            completion.wav += next_completion.wav
+                        elif next_completion.wav:
+                            completion.wav = next_completion.wav
+                        # ----- End Cornserve Integration -----
                     else:
                         # Replace the output with the new one
                         self.outputs[i] = next_completion

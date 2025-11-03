@@ -123,10 +123,15 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.prometheus import get_prometheus_registry
 from vllm.version import __version__ as VLLM_VERSION
 
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from cornserve.tracing import configure_otel
+
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
 logger = init_logger("vllm.entrypoints.openai.api_server")
+tracer = trace.get_tracer(__name__)
 
 _running_tasks: set[asyncio.Task] = set()
 
@@ -2009,12 +2014,21 @@ async def run_server_worker(
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
+    # ----- Cornserve Integration -----
+    if args.cornserve_sidecar_ranks:
+        logger.info("Cornserve: configuring OpenTelemetry with cornserve sidecar ranks")
+        configure_otel(f"vLLM{str(args.cornserve_sidecar_ranks).replace(' ', '')}")
+    # ----- End Cornserve Integration -----
+
     async with build_async_engine_client(
         args,
         client_config=client_config,
     ) as engine_client:
         maybe_register_tokenizer_info_endpoint(args)
         app = build_app(args)
+        # ----- Cornserve Integration -----
+        FastAPIInstrumentor().instrument_app(app)
+        # ----- End Cornserve Integration -----
 
         await init_app_state(engine_client, app.state, args)
 

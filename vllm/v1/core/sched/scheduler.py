@@ -40,7 +40,13 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm.v1.utils import create_sidecar_client
+from cornserve.sidecar.api import Sidecar
+from cornserve.sidecar.schema import SidecarConfig
+from opentelemetry import trace
+
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class Scheduler(SchedulerInterface):
@@ -179,6 +185,17 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+        # ----- Cornserve Integration -----
+        self.cornserve_config = vllm_config.cornserve_config
+        architechtures = vllm_config.model_config.architectures
+        self.is_qwen2_5_omni_thinker = "Qwen2_5OmniThinkerForConditionalGeneration" in architechtures
+        self.is_qwen3_omni_moe_thinker = "Qwen3OmniMoeForConditionalGeneration" in architechtures
+        # here we check talker only model for closing residual code streams
+        self.is_qwen3_omni_moe_talker = "Qwen3OmniMoeTalkerForConditionalGeneration" in architechtures
+        if self.cornserve_config:
+            self.sidecar_client: Sidecar = create_sidecar_client(vllm_config, True)
+        # ----- End Cornserve Integration -----
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -625,6 +642,23 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
+        # ----- Cornserve Integration -----
+        for request in scheduled_new_reqs:
+            if request.span:
+                request.span.add_event("scheduler.new")
+        for request in scheduled_running_reqs:
+            if request.span:
+                request.span.add_event("scheduler.continue", {
+                    "num_schedule_tokens": num_scheduled_tokens[request.request_id]
+                })
+        for request in scheduled_resumed_reqs:
+            if request.span:
+                request.span.add_event("scheduler.resume", {
+                    "num_schedule_tokens": num_scheduled_tokens[request.request_id]
+                })
+        logger.debug("num_scheduled_tokens: %s", num_scheduled_tokens)
+        # ----- End Cornserve Integration -----
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -669,6 +703,10 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            # ----- Cornserve Integration -----
+            request.step += 1
+            logger.debug("Request %s step %d", request.request_id, request.step)
+            # ----- End Cornserve Integration -----
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
             # may be updated again in _update_from_output for speculative
@@ -903,6 +941,9 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        # ----- Cornserve Integration -----
+        wav_outputs = model_runner_output.wavs
+        # ----- End Cornserve Integration -----
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -944,6 +985,10 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            # ----- Cornserve Integration -----
+            # Pass the tensor directly - conversion to WAV bytes happens in output_processor
+            wav_output = model_runner_output.wavs[req_index] if wav_outputs else None
+            # ----- End Cornserve Integration -----
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -982,12 +1027,94 @@ class Scheduler(SchedulerInterface):
                 pooler_output = pooler_outputs[req_index]
                 stopped = check_stop(request, self.max_model_len, pooler_output)
 
+
+            def handle_regular_model_stop(request: Request) -> None:
+                if request.sampling_params is None or request.sampling_params.extra_args is None:
+                    return
+                extra_args = request.sampling_params.extra_args
+                if ("cornserve_hidden_states_forward_id" not in extra_args or
+                    "cornserve_hidden_states_forward_ranks" not in extra_args):
+                    return
+                num_chunks = request.step
+                forward_id = extra_args["cornserve_hidden_states_forward_id"]
+                forward_ranks = extra_args["cornserve_hidden_states_forward_ranks"]
+                logger.debug("Handling regular model stop for request %s, forward_id: %s, forward_ranks: %s, num_chunks: %d",
+                    request.request_id, forward_id, forward_ranks, num_chunks)
+                self.sidecar_client.close_stream(
+                    id=forward_id,
+                    num_chunks=num_chunks,
+                    dst_sidecar_ranks=forward_ranks
+                )
+
+            # ----- Cornserve Integration -----
+            def handle_qwen3_omni_talker_stop(request: Request) -> None:
+                assert self.is_qwen3_omni_moe_talker
+                if request.sampling_params is None or request.sampling_params.extra_args is None:
+                    return
+                extra_args = request.sampling_params.extra_args
+                if ("cornserve_residual_codes_forward_id" not in extra_args or
+                    "cornserve_residual_codes_forward_ranks" not in extra_args):
+                    return
+                forward_id = extra_args["cornserve_residual_codes_forward_id"]
+                forward_ranks = extra_args["cornserve_residual_codes_forward_ranks"]
+                self.sidecar_client.close_stream(
+                    id=forward_id,
+                    num_chunks=request.step,
+                    dst_sidecar_ranks=forward_ranks
+                )
+
+            def handle_qwen3_omni_thinker_stop(request: Request) -> None:
+                assert self.is_qwen3_omni_moe_thinker
+                if request.sampling_params is None or request.sampling_params.extra_args is None:
+                    return
+                extra_args = request.sampling_params.extra_args
+                if ("cornserve_hidden_states_forward_id" not in extra_args or
+                    "cornserve_hidden_states_forward_ranks" not in extra_args):
+                    return
+                # extra chunk for control data
+                num_chunks = request.step + 1
+                forward_id = extra_args["cornserve_hidden_states_forward_id"]
+                forward_ranks = extra_args["cornserve_hidden_states_forward_ranks"]
+                output_token_ids = request._output_token_ids
+                forward_data = {
+                    "cornserve_thinker_output_token_ids": output_token_ids,
+                }
+                self.sidecar_client.send(
+                    data=forward_data,
+                    id=forward_id,
+                    dst_sidecar_ranks=forward_ranks,
+                    chunk_id = 0,
+                    stream=True
+                )
+                self.sidecar_client.close_stream(
+                    id=forward_id,
+                    num_chunks=num_chunks,
+                    dst_sidecar_ranks=forward_ranks
+                )
+            # ----- End Cornserve Integration -----
+
             if stopped:
+                logger.debug("Request %s stopped", req_id)
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
+
+                # ----- Cornserve Integration -----
+                if request.span:
+                    request.span.add_event("scheduler.stop")
+                    request.span.end()
+                if self.is_qwen3_omni_moe_thinker:
+                    handle_qwen3_omni_thinker_stop(request)
+                elif self.is_qwen2_5_omni_thinker:
+                    # TODO
+                    pass
+                elif self.is_qwen3_omni_moe_talker:
+                    handle_qwen3_omni_talker_stop(request)
+                else:
+                    handle_regular_model_stop(request)
+                # ----- End Cornserve Integration -----
 
             # Extract sample logprobs if needed.
             if (
@@ -1025,6 +1152,9 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        # ----- Cornserve Integration -----
+                        wav=wav_output,
+                        # ----- End Cornserve Integration -----
                     )
                 )
             else:
@@ -1285,6 +1415,10 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+        # ----- Cornserve Integration -----
+        if self.cornserve_config:
+            self.sidecar_client.shutdown_sync()
+        # ----- End Cornserve Integration -----
 
     ########################################################################
     # KV Connector Related Methods

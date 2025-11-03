@@ -1110,12 +1110,18 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
 
         self.llm_arch_name = config.text_config.architectures[0]
         self.is_mono = self.llm_arch_name == "InternLM2VEForCausalLM"
-        self.vision_model = self._init_vision_model(
-            config,
-            quant_config=quant_config,
-            is_mono=self.is_mono,
-            prefix=maybe_prefix(prefix, "vision_model"),
-        )
+        # ----- Cornserve Integration -----
+        if "CORNSERVE_VLLM_DISABLE_MULTIMODAL" in os.environ:
+            self.vision_model = None
+            print("Vision model is disabled since CORNSERVE_VLLM_DISABLE_MULTIMODAL is set.", flush=True)
+        else:
+            self.vision_model = self._init_vision_model(
+                config,
+                quant_config=quant_config,
+                is_mono=self.is_mono,
+                prefix=maybe_prefix(prefix, "vision_model"),
+            )
+        # ----- End Cornserve Integration -----
 
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
@@ -1438,6 +1444,11 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
             "temporal_token",
             "track_token",
         ]
+        # ----- Cornserve Integration -----
+        if "CORNSERVE_VLLM_DISABLE_MULTIMODAL" in os.environ:
+            skip_prefixes.append("vision_model")
+            print("Vision model disabled, skipping loading weights for it.", flush=True)
+        # ----- End Cornserve Integration -----
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights)
 

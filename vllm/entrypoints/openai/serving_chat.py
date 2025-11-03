@@ -32,6 +32,7 @@ from vllm.entrypoints.harmony_utils import (
     render_for_completion,
 )
 from vllm.entrypoints.logger import RequestLogger
+from openai.types.chat.chat_completion_audio import ChatCompletionAudio
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -72,7 +73,10 @@ from vllm.transformers_utils.tokenizers import (
 )
 from vllm.utils.collection_utils import as_list
 
+from opentelemetry import trace
+
 logger = init_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -167,6 +171,7 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        span = trace.get_current_span()
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -218,6 +223,7 @@ class OpenAIServingChat(OpenAIServing):
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
+            span.add_event("preprocess_chat.start")
             if not self.use_harmony:
                 # Common case.
                 error_check_ret = self._validate_chat_template(
@@ -252,6 +258,7 @@ class OpenAIServingChat(OpenAIServing):
                     request_prompts,
                     engine_prompts,
                 ) = self._make_request_with_harmony(request)
+            span.add_event("preprocess_chat.done")
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
@@ -324,6 +331,18 @@ class OpenAIServingChat(OpenAIServing):
                         trace_headers=trace_headers,
                         priority=request.priority,
                     )
+                    # ----- Cornserve Integration -----
+                    extra_args = sampling_params.extra_args
+                    if extra_args is not None:
+                        if "cornserve_talker_assistant_text" in extra_args:
+                            extra_text = extra_args["cornserve_talker_assistant_text"]
+                            extra_prompt_tokens_ids = self.processor.input_preprocessor._tokenize_prompt(extra_text)
+                            extra_args["cornserve_thinker_output_token_ids"] = extra_prompt_tokens_ids
+                            engine_request.sampling_params.extra_args["cornserve_thinker_output_token_ids"] = extra_prompt_tokens_ids
+                            # note for talker generation, we need to replace the last \n token id with the first assistant token id
+                            if extra_prompt_tokens_ids and engine_request.prompt_token_ids:
+                                engine_request.prompt_token_ids[-1] = extra_prompt_tokens_ids[0]
+                    # ----- End Cornserve Integration -----
 
                     generator = self.engine_client.generate(
                         engine_request,
@@ -1090,6 +1109,19 @@ class OpenAIServingChat(OpenAIServing):
                                 delta=True,
                             )
 
+                    # ----- Cornserve Integration -----
+                    if output.wav is not None:
+                        audio = ChatCompletionAudio(
+                            id="",
+                            data=output.wav,
+                            expires_at=int(time.time()) + 3600,
+                            transcript="",
+                        )
+                        delta_message.audio = audio
+                        # we also wipe out the text content
+                    if request.cornserve_return_audio:
+                        delta_message.content = None
+                    # ----- End Cornserve Integration -----
                     if output.finish_reason is None:
                         # Send token-by-token response for each request.n
                         choice_data = ChatCompletionResponseStreamChoice(

@@ -37,6 +37,10 @@ else:
     MultiModalKwargsItem = Any
     MultiModalPlaceholderDict = Any
 
+from .inputs import DataForward
+
+DATAFORWARD_MODALITIES = ["image", "video", "audio"]
+
 logger = init_logger(__name__)
 
 global_thread_pool = ThreadPoolExecutor(
@@ -175,7 +179,9 @@ class MediaConnector:
         media_io: MediaIO[_M],
         *,
         fetch_timeout: int | None = None,
-    ) -> _M:
+        # ----- Cornserve Integration -----
+    ) -> _M | DataForward[_M]:
+        # ----- End Cornserve Integration -----
         url_spec = urlparse(url)
         loop = asyncio.get_running_loop()
 
@@ -192,6 +198,37 @@ class MediaConnector:
             return await future
 
         if url_spec.scheme == "data":
+            # ----- Cornserve Integration -----
+            for modality in DATAFORWARD_MODALITIES:
+                if url_spec.path.startswith(f"{modality}/uuid;"):
+                    logger.debug(
+                        "Loading DataForward for modality '%s' from URL: %s",
+                        modality,
+                        url,
+                    )
+                    # url = f"data:image/uuid;data_id={uuid.uuid4().hex};url={original_url},"
+                    full_str = url_spec.path.replace(f"{modality}/uuid;", "")
+                    data_id_part, data_url = full_str.split(';url=', 1)
+                    data_id  = data_id_part.removeprefix('data_id=')
+                    if data_url.endswith(','):
+                        data_url = data_url[:-1]
+                    data_url_spec = urlparse(data_url)
+                    if data_url_spec.scheme.startswith("http"):
+                        data = await self.connection.async_get_bytes(
+                            data_url, timeout=fetch_timeout)
+                        return DataForward(id=data_id, data=media_io.load_bytes(data))
+                    elif data_url_spec.scheme == "file":
+                        data = self._load_file_url(data_url_spec, media_io)
+                        return DataForward(id=data_id, data=self._load_file_url(
+                            data_url_spec, media_io))
+                    elif data_url_spec.scheme == "data":
+                        data = self._load_data_url(data_url_spec, media_io)
+                        return DataForward(id=data_id, data=self._load_data_url(
+                            data_url_spec, media_io))
+                    else:
+                        raise ValueError(
+                            "The URL must be either a HTTP, data or file URL.")
+            # ----- End Cornserve Integration -----
             future = loop.run_in_executor(
                 global_thread_pool, self._load_data_url, url_spec, media_io
             )

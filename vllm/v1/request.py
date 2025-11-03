@@ -25,6 +25,7 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from opentelemetry.trace import Span
 
 
 class Request:
@@ -126,6 +127,11 @@ class Request:
         if block_hasher is not None:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
+        # ----- End Cornserve Integration -----
+        self.span: Span | None = None
+        # This is used to keep tracking scheduled steps for hidden states streaming
+        self.step: int = 0
+        # ----- End Cornserve Integration -----
 
     @classmethod
     def from_engine_core_request(

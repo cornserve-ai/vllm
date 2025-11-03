@@ -54,6 +54,12 @@ else:
 
 logger = init_logger(__name__)
 
+@config
+@dataclass
+class CornserveConfig:
+    """Configuration for CornServe."""
+    sidecar_ranks: list[int] = Field(default_factory=list)
+    """The ranks of the sidecar servers."""
 
 @config
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -112,6 +118,10 @@ class VllmConfig:
     you are using. Contents must be hashable."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
+    # ----- Cornserve Integration -----
+    cornserve_config: CornserveConfig | None = None
+    """Cornserve integration configuration."""
+    # ----- End Cornserve Integration -----
 
     def compute_hash(self) -> str:
         """
@@ -330,6 +340,15 @@ class VllmConfig:
 
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
+
+    def with_hf_text_config(
+        self,
+        hf_text_config: PretrainedConfig,
+    ) -> "VllmConfig":
+        hf_text_config = copy.deepcopy(hf_text_config)
+        model_config = copy.deepcopy(self.model_config)
+        model_config.hf_text_config = hf_text_config
+        return replace(self, model_config=model_config)
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""

@@ -15,6 +15,7 @@ from vllm.multimodal.inputs import (
     MultiModalEncDecInputs,
     MultiModalInputs,
     MultiModalUUIDDict,
+    DataForward,
 )
 from vllm.multimodal.processing import BaseMultiModalProcessor
 from vllm.transformers_utils.tokenizer import AnyTokenizer
@@ -41,6 +42,43 @@ from .parse import is_explicit_encoder_decoder_prompt, parse_singleton_prompt
 
 logger = init_logger(__name__)
 
+DATAFORWARD_MODALITIES = ["image", "video", "audio"]
+
+def _patch_data_forward(
+    mm_data: Mapping[str, object],
+) -> tuple[dict[str, list[str]], Mapping[str, object]]:
+    """
+    Patch mm_data processor inputs for Dataforward
+
+    returns
+    - mm_data_ids to add data_id back to
+    - mm_data to pass to processor
+    """
+    saved_mm_data_ids = {}
+    patched_mm_data = {}
+    for k, v in mm_data.items():
+        # modality, data_list
+        if k not in DATAFORWARD_MODALITIES:
+            patched_mm_data[k] = v
+            continue
+        if not isinstance(v, list):
+            patched_mm_data[k] = v
+            continue
+        data_list = v
+
+        data_ids =[]
+        processor_data = []
+        for d in data_list:
+            if isinstance(d, DataForward):
+                data_ids.append(d.id)
+                processor_data.append(d.data)
+            else:
+                data_ids.append(None)
+                processor_data.append(d)
+
+        saved_mm_data_ids[k] = data_ids
+        patched_mm_data[k] = processor_data
+    return saved_mm_data_ids, patched_mm_data
 
 class InputPreprocessor:
     def __init__(
@@ -267,6 +305,9 @@ class InputPreprocessor:
         if mm_processor_kwargs is None:
             mm_processor_kwargs = {}
 
+        # ----- Cornserve Integration -----
+        saved_mm_data_ids, mm_data = _patch_data_forward(mm_data)
+        # ----- End Cornserve Integration -----
         mm_input = mm_processor.apply(
             prompt,
             mm_data,
@@ -275,6 +316,14 @@ class InputPreprocessor:
             mm_uuids=mm_uuids,
         )
         mm_hashes = mm_input["mm_hashes"]
+
+        # ----- Cornserve Integration -----
+        if saved_mm_data_ids:
+            for k, v in saved_mm_data_ids.items():
+                placeholders = mm_input["mm_placeholders"][k]
+                for i, p in enumerate(placeholders):
+                    p.data_id = v[i]
+        # ----- End Cornserve Integration -----
 
         # Validate that all mm items have a string as their hash
         contains_only_strings = all(

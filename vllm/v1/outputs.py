@@ -162,6 +162,10 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # ----- Cornserve Integration -----
+    # for audio generation
+    wavs: list[torch.Tensor | None] = field(default_factory=list)
+    # ----- End Cornserve Integration -----
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

@@ -4,6 +4,7 @@
 from collections.abc import Callable, Iterable, Mapping, MutableSequence
 from typing import (
     TYPE_CHECKING,
+    Any,
     ClassVar,
     Literal,
     Protocol,
@@ -424,6 +425,37 @@ class SupportsPP(Protocol):
         """
         ...
 
+@runtime_checkable
+class PastHiddenStatesProcessing(Protocol):
+    """The interface required for all models that requires processing
+    past hidden states for.
+    """
+
+    process_past_hidden_states: ClassVar[Literal[True]] = True
+    """
+    A flag that indicates this model requires processing past hidden states.
+    """
+
+    # currently this is only for Qwen3-Omni's talker module
+    def prepare_inputs_from_past_hidden_states(
+        self,
+        trailing_text_hidden_states: Tensor,
+        input_ids: list[int],
+        past_hidden_states: Tensor,
+        generation_step: int,
+    ) -> Any:
+        """
+        Prepare model inputs from past hidden states.
+
+        Args:
+            past_hidden_states: The past hidden states tensor.
+        """
+        ...
+
+def requires_past_hidden_states_processing(
+    model: type[object] | object,
+) -> TypeIs[type[PastHiddenStatesProcessing]] | TypeIs[PastHiddenStatesProcessing]:
+    return getattr(model, "process_past_hidden_states", False)
 
 # We can't use runtime_checkable with ClassVar for issubclass checks
 # so we need to treat the class as an instance and use isinstance instead

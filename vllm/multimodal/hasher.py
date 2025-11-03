@@ -11,6 +11,7 @@ from blake3 import blake3
 from PIL import Image
 
 from vllm.logger import init_logger
+from vllm.multimodal.inputs import DataForward
 
 logger = init_logger(__name__)
 
@@ -100,6 +101,10 @@ class MultiModalHasher:
         hasher = blake3()
 
         for k, v in kwargs.items():
+            # ----- Cornserve Integration -----
+            if isinstance(v, DataForward):
+                v = v.data
+            # ----- End Cornserve Integration -----
             for bytes_ in cls.iter_item_to_bytes(k, v):
                 hasher.update(bytes_)
 
