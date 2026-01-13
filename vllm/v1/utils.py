@@ -424,11 +424,13 @@ def create_sidecar_client(vllm_config: VllmConfig, is_control_path: bool) -> Sid
         recv_hidden_size = 2048
     else:
         recv_hidden_size = vllm_config.model_config.get_hidden_size()
-    # hardcoded geri hidden size value
+    # hardcoded geri values
     if is_qwen3_omni_moe_talker_only:
         send_hidden_size = 16
+        send_hidden_dtype = torch.int64
     else:
         send_hidden_size = vllm_config.model_config.get_hidden_size()
+        send_hidden_dtype = vllm_config.model_config.dtype
     logger.info(f"Sidecar send_hidden_size: {send_hidden_size}, recv_hidden_size: {recv_hidden_size}")
 
     cornserve_config = vllm_config.cornserve_config
@@ -440,11 +442,7 @@ def create_sidecar_client(vllm_config: VllmConfig, is_control_path: bool) -> Sid
             recv_tensor_shape=(-1, recv_hidden_size),
             recv_tensor_dtype=vllm_config.model_config.dtype,
             send_tensor_shape=(-1, send_hidden_size),
-            send_tensor_dtype=(
-                torch.int64
-                if is_qwen3_omni_moe_talker_only
-                else vllm_config.model_config.dtype
-            ),
+            send_tensor_dtype=send_hidden_dtype,
         )
     )
     return sidecar_client
