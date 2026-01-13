@@ -1057,9 +1057,10 @@ class Scheduler(SchedulerInterface):
                     return
                 forward_id = extra_args["cornserve_residual_codes_forward_id"]
                 forward_ranks = extra_args["cornserve_residual_codes_forward_ranks"]
+                num_chunks = request.step - 1
                 self.sidecar_client.close_stream(
                     id=forward_id,
-                    num_chunks=request.step,
+                    num_chunks=num_chunks,
                     dst_sidecar_ranks=forward_ranks
                 )
 
