@@ -418,12 +418,19 @@ def tensor_data(tensor: torch.Tensor) -> memoryview:
 def create_sidecar_client(vllm_config: VllmConfig, is_control_path: bool) -> Sidecar:
     architechtures = vllm_config.model_config.architectures
     is_qwen3_omni_moe_talker = "Qwen3OmniMoeTalkerForConditionalGeneration" in architechtures or "Qwen3OmniMoeTalkerVocoderForConditionalGeneration" in architechtures
-    send_hidden_size = vllm_config.model_config.get_hidden_size()
+    is_qwen3_omni_moe_talker_only = "Qwen3OmniMoeTalkerForConditionalGeneration" in architechtures
     # hardcoded thinker hidden size value for qwen3-omni-moe-talker
     if is_qwen3_omni_moe_talker:
         recv_hidden_size = 2048
     else:
         recv_hidden_size = vllm_config.model_config.get_hidden_size()
+    # hardcoded geri values
+    if is_qwen3_omni_moe_talker_only:
+        send_hidden_size = 16
+        send_hidden_dtype = torch.int64
+    else:
+        send_hidden_size = vllm_config.model_config.get_hidden_size()
+        send_hidden_dtype = vllm_config.model_config.dtype
     logger.info(f"Sidecar send_hidden_size: {send_hidden_size}, recv_hidden_size: {recv_hidden_size}")
 
     cornserve_config = vllm_config.cornserve_config
@@ -435,7 +442,7 @@ def create_sidecar_client(vllm_config: VllmConfig, is_control_path: bool) -> Sid
             recv_tensor_shape=(-1, recv_hidden_size),
             recv_tensor_dtype=vllm_config.model_config.dtype,
             send_tensor_shape=(-1, send_hidden_size),
-            send_tensor_dtype=vllm_config.model_config.dtype,
+            send_tensor_dtype=send_hidden_dtype,
         )
     )
     return sidecar_client
