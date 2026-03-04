@@ -5,6 +5,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
+from transformers.generation.logits_process import LogitsProcessorList
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerConfig,
 )
@@ -58,6 +59,31 @@ except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
 logger = init_logger(__name__)
+
+
+class StableLogitsProcessor:
+    """Logits processor that clamps values to prevent numerical instability."""
+
+    def __init__(self, min_value: float = -100.0, max_value: float = 100.0):
+        self.min_value = min_value
+        self.max_value = max_value
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        """Clamp logits to prevent inf/nan in probability calculations."""
+        # Clamp to prevent overflow/underflow
+        scores = torch.clamp(scores, min=self.min_value, max=self.max_value)
+
+        # Check for any remaining nan/inf values and replace them
+        if torch.any(torch.isnan(scores)) or torch.any(torch.isinf(scores)):
+            logger.warning("Found nan/inf in logits after clamping, replacing with zeros")
+            scores = torch.where(
+                torch.isnan(scores) | torch.isinf(scores),
+                torch.zeros_like(scores),
+                scores
+            )
+
+        return scores
+
 
 class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
     """ResizeMLP to project from thinker hidden size to talker hidden size.
@@ -209,6 +235,9 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             "talker.": "",
         }
     )
+
+    merge_by_field_config = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -353,12 +382,17 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         # Generate codec tokens using code_predictor.generate()
         max_new_tokens = self.config.code_predictor_config.num_code_groups - 1  # 15
 
+        # Create logits processor for numerical stability
+        logits_processor = LogitsProcessorList([StableLogitsProcessor()])
+
         predictor_result = self.code_predictor.generate(
             inputs_embeds=predictor_input,
             max_new_tokens=max_new_tokens,
             do_sample=True,
+            temperature=1.0,
             top_k=50,
             top_p=0.8,
+            logits_processor=logits_processor,
             output_hidden_states=True,
             return_dict_in_generate=True,
         )
@@ -1143,4 +1177,3 @@ def find_pattern_in_tensor(input_ids: torch.Tensor, pattern: list[int]) -> list[
         if torch.equal(input_ids[i:i + pattern_len], pattern_tensor):
             indices.append(i)
     return indices
-

@@ -434,6 +434,18 @@ class AsyncLLM(EngineClient):
                     logger.debug("Cornserve: marking done request %s for data_id %s", request.request_id, p.data_id)
                     self.sidecar_client.mark_done_sync(p.data_id)
 
+        async def mark_done_dataforwards_async():
+            if not self.cornserve_config or not request.mm_features:
+                return
+            coros = []
+            for feature in request.mm_features:
+                p = feature.mm_position
+                if p.data_id is not None:
+                    logger.debug("Cornserve: marking done request %s for data_id %s", request.request_id, p.data_id)
+                    coros.append(self.sidecar_client.mark_done(p.data_id))
+            if coros:
+                await asyncio.gather(*coros)
+
         def mark_done_hidden_states(extra_args: dict[str, Any]):
             if not self.cornserve_config or "cornserve_hidden_states_recv_id" not in extra_args:
                 return
@@ -442,6 +454,20 @@ class AsyncLLM(EngineClient):
             for chunk_id in range(num_chunks):
                 logger.debug("Cornserve: marking done request %s for hidden_states_recv_id %s chunk_id %d", request.request_id, recv_id, chunk_id)
                 self.sidecar_client.mark_done_sync(recv_id, chunk_id=chunk_id)
+
+        async def mark_done_hidden_states_async():
+            if not self.cornserve_config or "cornserve_hidden_states_recv_id" not in extra_args:
+                return
+            recv_id = extra_args["cornserve_hidden_states_recv_id"]
+            logger.info("Cornserve: marking done request %s for all hidden_states_recv_id %s", request.request_id, recv_id)
+            # await self.sidecar_client.mark_done_all(recv_id)
+            num_chunks = extra_args.get("cornserve_hidden_states_recv_num_chunks", 0)
+            coros = []
+            for chunk_id in range(num_chunks):
+                logger.debug("Cornserve: marking done request %s for hidden_states_recv_id %s chunk_id %d", request.request_id, recv_id, chunk_id)
+                coros.append(self.sidecar_client.mark_done(recv_id, chunk_id=chunk_id))
+            if coros:
+                await asyncio.gather(*coros)
 
         carrier = {}
         propagator.inject(carrier)
@@ -597,8 +623,10 @@ class AsyncLLM(EngineClient):
             raise EngineGenerateError() from e
         finally:
             # ----- Cornserve Integration -----
-            mark_done_dataforwards()
-            mark_done_hidden_states(extra_args)
+            # mark_done_dataforwards()
+            await mark_done_dataforwards_async()
+            # mark_done_hidden_states(extra_args)
+            await mark_done_hidden_states_async()
             # ----- End Cornserve Integration -----
 
     def _run_output_handler(self):
