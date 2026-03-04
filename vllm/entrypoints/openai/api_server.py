@@ -2027,7 +2027,7 @@ async def run_server_worker(
         maybe_register_tokenizer_info_endpoint(args)
         app = build_app(args)
         # ----- Cornserve Integration -----
-        FastAPIInstrumentor().instrument_app(app)
+        FastAPIInstrumentor().instrument_app(app, exclude_spans=["send", "receive"])
         # ----- End Cornserve Integration -----
 
         await init_app_state(engine_client, app.state, args)

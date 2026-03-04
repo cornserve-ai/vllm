@@ -424,7 +424,7 @@ def create_sidecar_client(vllm_config: VllmConfig, is_control_path: bool) -> Sid
         recv_hidden_size = 2048
     else:
         recv_hidden_size = vllm_config.model_config.get_hidden_size()
-    # hardcoded geri values
+    # hardcoded geri hidden size value
     if is_qwen3_omni_moe_talker_only:
         send_hidden_size = 16
         send_hidden_dtype = torch.int64
