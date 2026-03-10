@@ -48,6 +48,7 @@ class CachedRequestState:
 
     # ----- Cornserve fields -----
     step: int = 0
+    otel_carrier: dict[str, str] | None = None
     # ----- End Cornserve fields -----
 
     def __post_init__(self):

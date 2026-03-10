@@ -9,6 +9,10 @@ from typing_extensions import deprecated
 
 from vllm._bc_linter import bc_linter_include
 
+from opentelemetry import propagate, trace as otel_trace
+
+otel_propagator = propagate.get_global_textmap()
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -41,6 +45,9 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    # ----- Cornserve Integration -----
+    otel_carrier: dict[str, str] | None = None
+    # ----- End Cornserve Integration -----
 
     @classmethod
     def from_request(
@@ -48,6 +55,14 @@ class NewRequestData:
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> "NewRequestData":
+        # ----- Cornserve Integration -----
+        otel_carrier: dict[str, str] | None = None
+        if request.span is not None:
+            carrier: dict[str, str] = {}
+            ctx = otel_trace.set_span_in_context(request.span)
+            otel_propagator.inject(carrier, context=ctx)
+            otel_carrier = carrier
+        # ----- End Cornserve Integration -----
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -58,6 +73,7 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            otel_carrier=otel_carrier,
         )
 
     def __repr__(self) -> str:

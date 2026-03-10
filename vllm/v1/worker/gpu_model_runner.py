@@ -152,6 +152,10 @@ from .utils import (
 
 from vllm.v1.utils import create_sidecar_client
 from cornserve.sidecar.api import Sidecar
+from opentelemetry import context as otel_context
+from opentelemetry import propagate
+
+otel_propagator = propagate.get_global_textmap()
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -773,6 +777,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                otel_carrier=new_req_data.otel_carrier,
             )
             self.requests[req_id] = req_state
 
@@ -3068,14 +3073,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             ]
                             # chunk_id is offset by 1 for omni thinker
                             chunk_id = req_state.step + 1
-                            self.sidecar_client.send(
-                                data=hs_slice,
-                                id=forward_id,
-                                dst_sidecar_ranks=forward_ranks,
-                                # hardcoded for thinker
-                                chunk_id=chunk_id,
-                                stream=True,
-                            )
+                            token = None
+                            try:
+                                if req_state.otel_carrier:
+                                    ctx = otel_propagator.extract(
+                                        req_state.otel_carrier
+                                    )
+                                    token = otel_context.attach(ctx)
+                                self.sidecar_client.send(
+                                    data=hs_slice,
+                                    id=forward_id,
+                                    dst_sidecar_ranks=forward_ranks,
+                                    # hardcoded for thinker
+                                    chunk_id=chunk_id,
+                                    stream=True,
+                                )
+                            finally:
+                                if token is not None:
+                                    otel_context.detach(token)
                     hidden_states = hidden_states[-1]
                 else:
                     # regular forwarding of last layer hidden states
@@ -3102,13 +3117,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             "cornserve_hidden_states_forward_ranks"
                         ]
                         chunk_id = req_state.step
-                        self.sidecar_client.send(
-                            data=hs_slice,
-                            id=forward_id,
-                            dst_sidecar_ranks=forward_ranks,
-                            chunk_id=chunk_id,
-                            stream=True,
-                        )
+                        token = None
+                        try:
+                            if req_state.otel_carrier:
+                                ctx = otel_propagator.extract(req_state.otel_carrier)
+                                token = otel_context.attach(ctx)
+                            self.sidecar_client.send(
+                                data=hs_slice,
+                                id=forward_id,
+                                dst_sidecar_ranks=forward_ranks,
+                                chunk_id=chunk_id,
+                                stream=True,
+                            )
+                        finally:
+                            if token is not None:
+                                otel_context.detach(token)
 
             if self.do_hidden_states_caching:
                 # Qwen3 Omni Talker requires previous step's hidden states for code prodectior
@@ -3333,13 +3356,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     req_id,
                     all_hidden_states.shape,
                 )
-                self.sidecar_client.send(
-                    data=all_hidden_states,
-                    id=forward_id,
-                    dst_sidecar_ranks=forward_ranks,
-                    chunk_id=1,
-                    stream=True,
-                )
+                token = None
+                try:
+                    if req_state.otel_carrier:
+                        ctx = otel_propagator.extract(req_state.otel_carrier)
+                        token = otel_context.attach(ctx)
+                    self.sidecar_client.send(
+                        data=all_hidden_states,
+                        id=forward_id,
+                        dst_sidecar_ranks=forward_ranks,
+                        chunk_id=1,
+                        stream=True,
+                    )
+                finally:
+                    if token is not None:
+                        otel_context.detach(token)
 
         if self.is_qwen3_omni_moe_talker and self.cornserve_config:
             for req_id in self.input_batch.req_ids:
@@ -3367,13 +3398,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         req_id,
                         all_residual_codes.shape,
                     )
-                    self.sidecar_client.send(
-                        data=all_residual_codes,
-                        id=forward_id,
-                        dst_sidecar_ranks=forward_ranks,
-                        chunk_id=0,
-                        stream=True,
-                    )
+                    token = None
+                    try:
+                        if req_state.otel_carrier:
+                            ctx = otel_propagator.extract(req_state.otel_carrier)
+                            token = otel_context.attach(ctx)
+                        self.sidecar_client.send(
+                            data=all_residual_codes,
+                            id=forward_id,
+                            dst_sidecar_ranks=forward_ranks,
+                            chunk_id=0,
+                            stream=True,
+                        )
+                    finally:
+                        if token is not None:
+                            otel_context.detach(token)
         # ----- End Cornserve Integration -----
 
         output = ModelRunnerOutput(
