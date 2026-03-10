@@ -50,6 +50,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 import json
 from cornserve.sidecar.api import Sidecar
+from opentelemetry import context as otel_context
 from opentelemetry import trace, propagate
 from vllm.v1.utils import create_sidecar_client
 
@@ -375,7 +376,6 @@ class AsyncLLM(EngineClient):
     # requests we don't need to send multiple messages to core proc,
     # and so we don't need multiple streams which then get
     # re-multiplexed in the API server anyhow.
-    @tracer.start_as_current_span(name="AsyncLLM.generate")
     async def generate(
         self,
         prompt: EngineCoreRequest | PromptType,
@@ -405,10 +405,18 @@ class AsyncLLM(EngineClient):
         """
 
         # ----- Cornserve Integration -----
+        # NOTE: We manually manage the span instead of using
+        # @tracer.start_as_current_span because that decorator does not
+        # properly handle async generators -- it ends the span when the
+        # generator object is created (~microseconds) rather than when
+        # iteration completes.
+        span = tracer.start_span("AsyncLLM.generate")
+        ctx = trace.set_span_in_context(span)
+        token = otel_context.attach(ctx)
+
         assert isinstance(prompt, EngineCoreRequest)
         # this disables beam search and audio transcription/translation
         request = prompt
-        span = trace.get_current_span()
         span.set_attribute("request_id", request_id)
         if self.cornserve_config \
                 and (mm_features := request.mm_features):
@@ -627,6 +635,8 @@ class AsyncLLM(EngineClient):
             await mark_done_dataforwards_async()
             # mark_done_hidden_states(extra_args)
             await mark_done_hidden_states_async()
+            span.end()
+            otel_context.detach(token)
             # ----- End Cornserve Integration -----
 
     def _run_output_handler(self):

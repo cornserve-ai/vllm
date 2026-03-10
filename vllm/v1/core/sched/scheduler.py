@@ -1142,9 +1142,17 @@ class Scheduler(SchedulerInterface):
                     stopped_preempted_reqs.add(request)
 
                 # ----- Cornserve Integration -----
+                # Activate request.span so that sidecar calls become children
+                # of EngineCore.add_request in the trace.
+                span_ctx = (
+                    trace.use_span(request.span, end_on_exit=False)
+                    if request.span
+                    else None
+                )
+                if span_ctx:
+                    span_ctx.__enter__()
                 if request.span:
                     request.span.add_event("scheduler.stop")
-                    request.span.end()
                 if self.is_qwen3_omni_moe_thinker:
                     handle_qwen3_omni_thinker_stop(request)
                 elif self.is_qwen2_5_omni_thinker:
@@ -1154,6 +1162,10 @@ class Scheduler(SchedulerInterface):
                     handle_qwen3_omni_talker_stop(request)
                 else:
                     handle_regular_model_stop(request)
+                if request.span:
+                    request.span.end()
+                if span_ctx:
+                    span_ctx.__exit__(None, None, None)
                 # ----- End Cornserve Integration -----
 
             # Extract sample logprobs if needed.
