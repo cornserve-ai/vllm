@@ -569,7 +569,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # request_id -> previous step's hidden states tensor
             self.do_hidden_states_caching = True
             self._cached_past_hidden_states = dict[str, torch.Tensor]()
-            self._cached_trailing_text_embeds = dict[str, torch.Tensor]()
+            self._cached_trailing_text_hidden = dict[str, torch.Tensor]()
             self._cached_thinker_hidden_states = dict[str, torch.Tensor]()
             self.audio_residual_codes = defaultdict(list)
         else:
@@ -705,7 +705,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Also clean up per-request cached states used in Cornserve integration
             if self.do_hidden_states_caching:
                 self._cached_past_hidden_states.pop(req_id, None)
-                self._cached_trailing_text_embeds.pop(req_id, None)
+                self._cached_trailing_text_hidden.pop(req_id, None)
                 self._cached_thinker_hidden_states.pop(req_id, None)
             if getattr(self.model, "is_audio_generator", False):
                 self.audio_residual_codes.pop(req_id, None)
@@ -1989,11 +1989,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 mm_data_native.append((mm_kwarg, mm_hash, pos_info))
 
-        logger.info(
-            "Cornserve: on-demand MM encoder (remote=%d, native=%d)",
-            len(mm_data_remote),
-            len(mm_data_native),
-        )
+        if get_tp_group().is_first_rank:
+            logger.info(
+                "Cornserve: on-demand MM encoder (remote=%d, native=%d)",
+                len(mm_data_remote),
+                len(mm_data_native),
+            )
 
         # Fetch remote encoder outputs
         for mm_kwarg, mm_hash, pos_info in mm_data_remote:
@@ -2389,7 +2390,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         hidden_states: torch.Tensor,
     ) -> None:
-        """First slices the hidden states tensor based on the scheduled tokens."""
+        """Cache only the latest hidden state per request for decode."""
         offset = 0
         for req_id in self.input_batch.req_ids:
             n_tok = scheduler_output.num_scheduled_tokens[req_id]
@@ -2397,7 +2398,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 continue
             hs_slice = hidden_states[offset : offset + n_tok]
             offset += n_tok
-            self._cached_past_hidden_states[req_id] = hs_slice.cpu()
+            self._cached_past_hidden_states[req_id] = hs_slice[-1:].detach().clone()
 
     def get_request_position_mapping(
         self,
@@ -2925,7 +2926,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             "output_token_ids is required for talker models"
                         )
 
-                    if req_id not in self._cached_trailing_text_embeds:
+                    if req_id not in self._cached_trailing_text_hidden:
                         trailing_text_token_ids = extra_args[
                             "cornserve_thinker_output_token_ids"
                         ][1:]
@@ -2937,15 +2938,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         trailing_text_embeds = self.model.thinker_text_embed(
                             trailing_text_token_ids_tensor
                         )  # type: ignore
-                        self._cached_trailing_text_embeds[req_id] = trailing_text_embeds
+                        trailing_text_hidden = self.model.text_projection(
+                            trailing_text_embeds
+                        )  # type: ignore
+                        self._cached_trailing_text_hidden[req_id] = trailing_text_hidden
                     else:
-                        trailing_text_embeds = self._cached_trailing_text_embeds[req_id]
+                        trailing_text_hidden = self._cached_trailing_text_hidden[req_id]
 
                     generation_step = num_output_tokens - 1
                     new_inputs_embeds, residual_codes = (
                         self.model.prepare_inputs_from_past_hidden_states(  # type: ignore
-                            trailing_text_embeds,
-                            req_state.prompt_token_ids + req_state.output_token_ids,
+                            trailing_text_hidden,
+                            req_state.output_token_ids[-1],
                             past_hidden_states,
                             generation_step,
                         )
