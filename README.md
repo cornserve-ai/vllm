@@ -14,3 +14,7 @@ A fork of [vLLM](https://github.com/vllm-project/vllm), maintained for use insid
 
 - vLLM: <https://docs.vllm.ai>
 - Cornserve: <https://cornserve.ai>
+
+## Contributing
+
+Contributions are welcome. Please refer to the [Cornserve contributor guide](https://cornserve.ai/contributor_guide/) for guidelines.
