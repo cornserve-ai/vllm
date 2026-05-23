@@ -50,7 +50,6 @@ from vllm.v1.metrics.stats import IterationStats
 
 import json
 from cornserve.sidecar.api import Sidecar
-from opentelemetry import context as otel_context
 from opentelemetry import trace, propagate
 from vllm.v1.utils import create_sidecar_client
 
@@ -376,6 +375,7 @@ class AsyncLLM(EngineClient):
     # requests we don't need to send multiple messages to core proc,
     # and so we don't need multiple streams which then get
     # re-multiplexed in the API server anyhow.
+    @tracer.start_as_current_span(name="AsyncLLM.generate")
     async def generate(
         self,
         prompt: EngineCoreRequest | PromptType,
@@ -405,21 +405,14 @@ class AsyncLLM(EngineClient):
         """
 
         # ----- Cornserve Integration -----
-        # NOTE: We manually manage the span instead of using
-        # @tracer.start_as_current_span because that decorator does not
-        # properly handle async generators -- it ends the span when the
-        # generator object is created (~microseconds) rather than when
-        # iteration completes.
-        span = tracer.start_span("AsyncLLM.generate")
-        ctx = trace.set_span_in_context(span)
-        token = otel_context.attach(ctx)
-
         assert isinstance(prompt, EngineCoreRequest)
         # this disables beam search and audio transcription/translation
         request = prompt
+        span = trace.get_current_span()
         span.set_attribute("request_id", request_id)
         if self.cornserve_config \
-                and (mm_features := request.mm_features):
+            and (mm_features := request.mm_features) \
+            and not "CORNSERVE_PROFILING" in os.environ:
             # check data_ids
             coros = []
             for feature in mm_features:
@@ -443,7 +436,9 @@ class AsyncLLM(EngineClient):
                     self.sidecar_client.mark_done_sync(p.data_id)
 
         async def mark_done_dataforwards_async():
-            if not self.cornserve_config or not request.mm_features:
+            if not self.cornserve_config \
+                or not request.mm_features \
+                or "CORNSERVE_PROFILING" in os.environ:
                 return
             coros = []
             for feature in request.mm_features:
@@ -457,6 +452,8 @@ class AsyncLLM(EngineClient):
         def mark_done_hidden_states(extra_args: dict[str, Any]):
             if not self.cornserve_config or "cornserve_hidden_states_recv_id" not in extra_args:
                 return
+            if hs_early_freed:
+                return
             recv_id = extra_args["cornserve_hidden_states_recv_id"]
             num_chunks = extra_args.get("cornserve_hidden_states_recv_num_chunks", 0)
             for chunk_id in range(num_chunks):
@@ -465,6 +462,9 @@ class AsyncLLM(EngineClient):
 
         async def mark_done_hidden_states_async():
             if not self.cornserve_config or "cornserve_hidden_states_recv_id" not in extra_args:
+                return
+            # Skip if already early-freed in the generate loop.
+            if hs_early_freed:
                 return
             recv_id = extra_args["cornserve_hidden_states_recv_id"]
             logger.info("Cornserve: marking done request %s for all hidden_states_recv_id %s", request.request_id, recv_id)
@@ -482,7 +482,7 @@ class AsyncLLM(EngineClient):
         request.otel_carrier = carrier
 
         # Cornserve relies on vllm_xargs, which lives within sampling_params
-        logger.debug("Request sampling_params: %s", request.sampling_params)
+        # logger.debug("Request sampling_params: %s", request.sampling_params)
         assert request.sampling_params is not None
         extra_args = request.sampling_params.extra_args or {}
 
@@ -492,10 +492,27 @@ class AsyncLLM(EngineClient):
             if k.startswith("cornserve_") and k.endswith("_ranks"):
                 new_args[k] = json.loads(v)
         extra_args.update(new_args)
-        logger.debug("Request sampling_params after parsing ranks: %s", request.sampling_params)
+        # logger.debug("Request sampling_params after parsing ranks: %s", request.sampling_params)
 
         # talker as consumer
-        if "cornserve_hidden_states_recv_id" in extra_args:
+        if "cornserve_dummy_talker" in extra_args:
+            assert request.prompt_token_ids is not None
+
+            # Fake thinker output token IDs (length = thinker_output_len).
+            thinker_output_len = int(extra_args["cornserve_dummy_thinker_output_len"])
+            talker_token_ids = [0] * thinker_output_len
+            extra_args["cornserve_thinker_output_token_ids"] = talker_token_ids
+            request.prompt_token_ids[-1] = talker_token_ids[0]
+
+            # Sidecar is ignored in dummy mode.
+            extra_args["cornserve_hidden_states_recv_num_chunks"] = 0
+
+            logger.debug(
+                "Dummy talker mode: hidden_states_len=%s, thinker_output_len=%d",
+                extra_args.get("cornserve_dummy_thinker_hidden_states_len"),
+                thinker_output_len,
+            )
+        elif "cornserve_hidden_states_recv_id" in extra_args:
             # chunk 0 is control args, we'll insert them directly into sampling_params
             # see vllm/v1/core/sched/scheduler.py, the rest are hidden states -- handled by gpu_model_runner
             recv_id = extra_args["cornserve_hidden_states_recv_id"]
@@ -528,7 +545,7 @@ class AsyncLLM(EngineClient):
             logger.debug("Received kv_transfer_params for recv_id %s: %s", recv_id, kv_transfer_params)
         sampling_params.extra_args = extra_args
         request.sampling_params.extra_args = extra_args
-        logger.debug("Request sampling_params: %s", request.sampling_params)
+        # logger.debug("Request sampling_params: %s", request.sampling_params)
         # ----- End Cornserve Integration -----
 
         if (
@@ -541,6 +558,7 @@ class AsyncLLM(EngineClient):
                 "prompt logprobs"
             )
 
+        hs_early_freed = False
         try:
             # We start the output_handler on the first call to generate() so
             # we can call __init__ before the event loop, which enables us
@@ -581,6 +599,17 @@ class AsyncLLM(EngineClient):
                 # own request cleanup based on finished.
                 finished = out.finished
                 assert isinstance(out, RequestOutput)
+
+                # ----- Cornserve: early free hidden states -----
+                # After the first output the model runner has consumed
+                # and cached the hidden states on GPU, so we can release
+                # the sidecar shared-memory buffers now.  This unblocks
+                # the thinker's sender sidecar for new sends.
+                if not hs_early_freed:
+                    await mark_done_hidden_states_async()
+                    hs_early_freed = True
+                # ----- End Cornserve: early free hidden states -----
+
                 yield out
 
             # ----- Cornserve Integration -----
@@ -635,8 +664,6 @@ class AsyncLLM(EngineClient):
             await mark_done_dataforwards_async()
             # mark_done_hidden_states(extra_args)
             await mark_done_hidden_states_async()
-            span.end()
-            otel_context.detach(token)
             # ----- End Cornserve Integration -----
 
     def _run_output_handler(self):
