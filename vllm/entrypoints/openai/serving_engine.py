@@ -13,6 +13,7 @@ from typing import Any, ClassVar, Generic, TypeAlias, TypeVar
 import torch
 from fastapi import Request
 from pydantic import BaseModel, ConfigDict, Field
+from opentelemetry import trace as otel_trace
 from starlette.datastructures import Headers
 from typing_extensions import TypeIs
 
@@ -1038,8 +1039,11 @@ class OpenAIServing:
         Sequence[RequestPrompt],
         list[EngineTokensPrompt],
     ]:
+        span = otel_trace.get_current_span()
+
         model_config = self.model_config
 
+        span.add_event("resolve_content_format.start")
         resolved_content_format = resolve_chat_template_content_format(
             chat_template,
             tool_dicts,
@@ -1047,12 +1051,16 @@ class OpenAIServing:
             tokenizer,
             model_config=model_config,
         )
+        span.add_event("resolve_content_format.done")
+
+        span.add_event("parse_chat_messages.start")
         conversation, mm_data_future, mm_uuids = parse_chat_messages_futures(
             messages,
             model_config,
             tokenizer,
             content_format=resolved_content_format,
         )
+        span.add_event("parse_chat_messages.done")
 
         _chat_template_kwargs: dict[str, Any] = dict(
             chat_template=chat_template,
@@ -1065,6 +1073,7 @@ class OpenAIServing:
 
         request_prompt: str | list[int]
 
+        span.add_event("apply_chat_template.start")
         if tokenizer is None:
             request_prompt = "placeholder"
         elif isinstance(tokenizer, MistralTokenizer):
@@ -1080,8 +1089,11 @@ class OpenAIServing:
                 model_config=model_config,
                 **_chat_template_kwargs,
             )
+        span.add_event("apply_chat_template.done")
 
+        span.add_event("fetch_multimodal_data.start")
         mm_data = await mm_data_future
+        span.add_event("fetch_multimodal_data.done")
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
@@ -1099,6 +1111,7 @@ class OpenAIServing:
                 request=request
             )
 
+        span.add_event("tokenize.start")
         if tokenizer is None:
             assert isinstance(request_prompt, str), (
                 "Prompt has to be a string",
@@ -1123,6 +1136,7 @@ class OpenAIServing:
                 prompt=tokenizer.decode(request_prompt),
                 prompt_token_ids=request_prompt,
             )
+        span.add_event("tokenize.done")
 
         engine_prompt = EngineTokensPrompt(
             prompt_token_ids=prompt_inputs["prompt_token_ids"]

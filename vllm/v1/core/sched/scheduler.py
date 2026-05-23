@@ -190,16 +190,10 @@ class Scheduler(SchedulerInterface):
         # ----- Cornserve Integration -----
         self.cornserve_config = vllm_config.cornserve_config
         architechtures = vllm_config.model_config.architectures
-        self.is_qwen2_5_omni_thinker = (
-            "Qwen2_5OmniThinkerForConditionalGeneration" in architechtures
-        )
-        self.is_qwen3_omni_moe_thinker = (
-            "Qwen3OmniMoeForConditionalGeneration" in architechtures
-        )
+        self.is_qwen2_5_omni_thinker = "Qwen2_5OmniThinkerForConditionalGeneration" in architechtures
+        self.is_qwen3_omni_moe_thinker = "Qwen3OmniMoeForConditionalGeneration" in architechtures
         # here we check talker only model for closing residual code streams
-        self.is_qwen3_omni_moe_talker = (
-            "Qwen3OmniMoeTalkerForConditionalGeneration" in architechtures
-        )
+        self.is_qwen3_omni_moe_talker = "Qwen3OmniMoeTalkerForConditionalGeneration" in architechtures
         if self.cornserve_config:
             self.sidecar_client: Sidecar = create_sidecar_client(vllm_config, True)
         self.stream_hidden_states = "CORNSERVE_VLLM_STREAM_HIDDEN_STATES" in os.environ
@@ -651,22 +645,18 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         # ----- Cornserve Integration -----
+        # Only record scheduler.new / scheduler.resume / scheduler.stop events.
+        # Per-step scheduler.continue events are omitted to avoid flooding the
+        # OTel event buffer (default 128 cap) which drops the oldest events.
         for request in scheduled_new_reqs:
             if request.span:
                 request.span.add_event("scheduler.new")
-        for request in scheduled_running_reqs:
-            if request.span:
-                request.span.add_event(
-                    "scheduler.continue",
-                    {"num_schedule_tokens": num_scheduled_tokens[request.request_id]},
-                )
         for request in scheduled_resumed_reqs:
             if request.span:
-                request.span.add_event(
-                    "scheduler.resume",
-                    {"num_schedule_tokens": num_scheduled_tokens[request.request_id]},
-                )
-        logger.debug("num_scheduled_tokens: %s", num_scheduled_tokens)
+                request.span.add_event("scheduler.resume", {
+                    "num_schedule_tokens": num_scheduled_tokens[request.request_id]
+                })
+        # logger.debug("num_scheduled_tokens: %s", num_scheduled_tokens)
         # ----- End Cornserve Integration -----
 
         scheduler_output = SchedulerOutput(
@@ -715,7 +705,7 @@ class Scheduler(SchedulerInterface):
             request.num_computed_tokens += num_scheduled_token
             # ----- Cornserve Integration -----
             request.step += 1
-            logger.debug("Request %s step %d", request.request_id, request.step)
+            # logger.debug("Request %s step %d", request.request_id, request.step)
             # ----- End Cornserve Integration -----
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
@@ -870,6 +860,12 @@ class Scheduler(SchedulerInterface):
                 if self.encoder_cache_manager.check_and_update_cache(request, i):
                     # The encoder input is already computed and cached from a
                     # previous step.
+                    # ----- Cornserve Integration -----
+                    if request.span:
+                        request.span.add_event("encoder.cache_hit", {
+                            "encoder_tokens": num_encoder_tokens,
+                        })
+                    # ----- End Cornserve Integration -----
                     continue
 
             # If no encoder input chunking is allowed, we do not want to
@@ -907,6 +903,12 @@ class Scheduler(SchedulerInterface):
             encoder_compute_budget -= num_encoder_tokens
             mm_hashes_to_schedule.add(request.mm_features[i].identifier)
             encoder_inputs_to_schedule.append(i)
+            # ----- Cornserve Integration -----
+            if request.span:
+                request.span.add_event("encoder.scheduled", {
+                    "encoder_tokens": num_encoder_tokens,
+                })
+            # ----- End Cornserve Integration -----
 
         return (
             encoder_inputs_to_schedule,
@@ -1027,6 +1029,13 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
+                # ----- Cornserve Integration -----
+                # Emit an event on the first output token so the otel processor
+                # can compute prefill compute latency independently of KV transfer.
+                if (request.span is not None
+                        and len(request._output_token_ids) == 0):
+                    request.span.add_event("scheduler.first_token")
+                # ----- End Cornserve Integration -----
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
@@ -1037,75 +1046,52 @@ class Scheduler(SchedulerInterface):
                 pooler_output = pooler_outputs[req_index]
                 stopped = check_stop(request, self.max_model_len, pooler_output)
 
+
             def handle_regular_model_stop(request: Request) -> None:
-                if (
-                    request.sampling_params is None
-                    or request.sampling_params.extra_args is None
-                ):
+                if request.sampling_params is None or request.sampling_params.extra_args is None:
                     return
                 extra_args = request.sampling_params.extra_args
-                if (
-                    "cornserve_hidden_states_forward_id" not in extra_args
-                    or "cornserve_hidden_states_forward_ranks" not in extra_args
-                ):
+                if ("cornserve_hidden_states_forward_id" not in extra_args or
+                    "cornserve_hidden_states_forward_ranks" not in extra_args):
                     return
                 num_chunks = request.step
                 forward_id = extra_args["cornserve_hidden_states_forward_id"]
                 forward_ranks = extra_args["cornserve_hidden_states_forward_ranks"]
-                logger.debug(
-                    "Handling regular model stop for request %s, forward_id: %s, forward_ranks: %s, num_chunks: %d",
-                    request.request_id,
-                    forward_id,
-                    forward_ranks,
-                    num_chunks,
-                )
+                logger.debug("Handling regular model stop for request %s, forward_id: %s, forward_ranks: %s, num_chunks: %d",
+                    request.request_id, forward_id, forward_ranks, num_chunks)
                 self.sidecar_client.close_stream(
                     id=forward_id,
                     num_chunks=num_chunks,
-                    dst_sidecar_ranks=forward_ranks,
+                    dst_sidecar_ranks=forward_ranks
                 )
 
             # ----- Cornserve Integration -----
             def handle_qwen3_omni_talker_stop(request: Request) -> None:
                 assert self.is_qwen3_omni_moe_talker
-                if (
-                    request.sampling_params is None
-                    or request.sampling_params.extra_args is None
-                ):
+                if request.sampling_params is None or request.sampling_params.extra_args is None:
                     return
                 extra_args = request.sampling_params.extra_args
-                if (
-                    "cornserve_residual_codes_forward_id" not in extra_args
-                    or "cornserve_residual_codes_forward_ranks" not in extra_args
-                ):
+                if ("cornserve_residual_codes_forward_id" not in extra_args or
+                    "cornserve_residual_codes_forward_ranks" not in extra_args):
                     return
                 forward_id = extra_args["cornserve_residual_codes_forward_id"]
                 forward_ranks = extra_args["cornserve_residual_codes_forward_ranks"]
-                logger.info(
-                    "Closing stream for Qwen3 Omni MoE Talker request %s, forward_id: %s, forward_ranks: %s with num_chunks=1",
-                    request.request_id,
-                    forward_id,
-                    forward_ranks,
-                )
+                logger.info("Closing stream for Qwen3 Omni MoE Talker request %s, forward_id: %s, forward_ranks: %s with num_chunks=1",
+                    request.request_id, forward_id, forward_ranks)
                 self.sidecar_client.close_stream(
                     id=forward_id,
                     # num_chunks=request.step - 1,
                     num_chunks=1,
-                    dst_sidecar_ranks=forward_ranks,
+                    dst_sidecar_ranks=forward_ranks
                 )
 
             def handle_qwen3_omni_thinker_stop(request: Request) -> None:
                 assert self.is_qwen3_omni_moe_thinker
-                if (
-                    request.sampling_params is None
-                    or request.sampling_params.extra_args is None
-                ):
+                if request.sampling_params is None or request.sampling_params.extra_args is None:
                     return
                 extra_args = request.sampling_params.extra_args
-                if (
-                    "cornserve_hidden_states_forward_id" not in extra_args
-                    or "cornserve_hidden_states_forward_ranks" not in extra_args
-                ):
+                if ("cornserve_hidden_states_forward_id" not in extra_args or
+                    "cornserve_hidden_states_forward_ranks" not in extra_args):
                     return
                 # extra chunk for control data
                 num_chunks = request.step + 1
@@ -1119,8 +1105,8 @@ class Scheduler(SchedulerInterface):
                     data=forward_data,
                     id=forward_id,
                     dst_sidecar_ranks=forward_ranks,
-                    chunk_id=0,
-                    stream=True,
+                    chunk_id = 0,
+                    stream=True
                 )
                 if not self.stream_hidden_states:
                     num_chunks = 2
@@ -1128,13 +1114,12 @@ class Scheduler(SchedulerInterface):
                 self.sidecar_client.close_stream(
                     id=forward_id,
                     num_chunks=num_chunks,
-                    dst_sidecar_ranks=forward_ranks,
+                    dst_sidecar_ranks=forward_ranks
                 )
-
             # ----- End Cornserve Integration -----
 
             if stopped:
-                logger.debug("Request %s stopped", req_id)
+                # logger.debug("Request %s stopped", req_id)
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1142,8 +1127,6 @@ class Scheduler(SchedulerInterface):
                     stopped_preempted_reqs.add(request)
 
                 # ----- Cornserve Integration -----
-                # Activate request.span so that sidecar calls become children
-                # of EngineCore.add_request in the trace.
                 span_ctx = (
                     trace.use_span(request.span, end_on_exit=False)
                     if request.span
@@ -1152,6 +1135,8 @@ class Scheduler(SchedulerInterface):
                 if span_ctx:
                     span_ctx.__enter__()
                 if request.span:
+                    request.span.set_attribute("num_prompt_tokens", request.num_prompt_tokens)
+                    request.span.set_attribute("num_output_tokens", request.num_output_tokens)
                     request.span.add_event("scheduler.stop")
                 if self.is_qwen3_omni_moe_thinker:
                     handle_qwen3_omni_thinker_stop(request)
@@ -1352,6 +1337,10 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+        # ----- Cornserve Integration -----
+        if request.span:
+            request.span.add_event("scheduler.enqueue")
+        # ----- End Cornserve Integration -----
 
     def finish_requests(
         self,

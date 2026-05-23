@@ -552,6 +552,17 @@ def _enable_processor_cache(
 
 
 def _enable_ipc_cache(vllm_config: "VllmConfig") -> bool:
+    # ----- Cornserve Integration -----
+    # Disable the P0/P1 mirrored IPC cache when Cornserve is configured.
+    # Data forwards use an async await (sidecar recv) between the P0 sender
+    # cache update and add_request delivery to P1, which can reorder requests
+    # and desync the mirrored LRU caches. With IPC cache disabled, P0 falls
+    # back to MultiModalProcessorOnlyCache (caches processed data locally and
+    # always sends it to P1), avoiding the ordering dependency.
+    if vllm_config.cornserve_config is not None:
+        return False
+    # ----- End Cornserve Integration -----
+
     parallel_config = vllm_config.parallel_config
     supports_ipc_cache = (
         parallel_config._api_process_count == 1

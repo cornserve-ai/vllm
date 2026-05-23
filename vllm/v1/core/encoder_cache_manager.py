@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections import OrderedDict
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -8,6 +9,8 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalRegistry
 from vllm.v1.request import Request
+
+_NO_ENCODER_CACHE = "CORNSERVE_NO_ENCODER_CACHE" in os.environ
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, SchedulerConfig
@@ -91,6 +94,13 @@ class EncoderCacheManager:
         if mm_hash not in self.cached:
             return False
 
+        # ----- Cornserve: run encoder once per request, no cross-request reuse -----
+        # Allow cache hit only if THIS request already owns a reference
+        # (second call for same request). Block reuse from other requests.
+        if _NO_ENCODER_CACHE and request.request_id not in self.cached[mm_hash]:
+            return False
+        # ----- End Cornserve -----
+
         # Cached but currently not referenced by any request
         if not self.cached[mm_hash]:
             num_tokens = self.freeable.pop(mm_hash)
@@ -134,6 +144,13 @@ class EncoderCacheManager:
         Note: This method does not allocate physical memory for the encoder
         output but only the state of EncoderCacheManager.
         """
+        # ----- Cornserve: already allocated, no extra space needed -----
+        if _NO_ENCODER_CACHE:
+            mm_hash = request.mm_features[input_id].identifier
+            if mm_hash in self.cached:
+                return True
+        # ----- End Cornserve -----
+
         num_tokens = request.get_num_encoder_tokens(input_id)
 
         # Not enough compute budget
@@ -173,6 +190,20 @@ class EncoderCacheManager:
 
         mm_hash = request.mm_features[input_id].identifier
         request_id = request.request_id
+
+        # ----- Cornserve: already allocated, just add reference -----
+        if _NO_ENCODER_CACHE and mm_hash in self.cached:
+            # If the entry has no active references, it was moved to
+            # `freeable` when the last request released it.  Remove it
+            # from `freeable` so it cannot be evicted while we hold a
+            # new reference.
+            if not self.cached[mm_hash]:
+                num_tokens = self.freeable.pop(mm_hash)
+                self.num_freeable_slots -= num_tokens
+            self.cached[mm_hash].add(request_id)
+            return
+        # ----- End Cornserve -----
+
         if mm_hash not in self.cached:
             self.cached[mm_hash] = set()
 

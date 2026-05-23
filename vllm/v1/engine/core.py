@@ -551,6 +551,10 @@ class EngineCore:
             span_context = propagator.extract(request.otel_carrier)
             span = tracer.start_span("EngineCore.add_request", context=span_context)
             span.set_attribute("max_tokens", req.max_tokens)
+            span.set_attribute("mm.num_items", len(req.mm_features))
+            for i, feature in enumerate(req.mm_features):
+                span.set_attribute(f"mm.{i}.modality", feature.modality)
+                span.set_attribute(f"mm.{i}.encoder_tokens", feature.mm_position.length)
             req.span = span
         # ----- End Cornserve Integration -----
         if req.use_structured_output:
